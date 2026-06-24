@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Datos locales y respaldos generados por la herramienta
+*.backup_*.xlsx
+_probe*.py
+_tmp_*
+~$*.xlsx
+
+# Excel del cliente (no versionar datos reales)
+/data/
+*.local.xlsx
