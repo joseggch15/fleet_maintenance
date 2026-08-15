@@ -40,12 +40,12 @@ CHART_EQUIPMENT = "equipment"
 CHART_STATUS = "status"
 MAINTENANCE_CHARTS = (CHART_BARS, CHART_PIE, CHART_EQUIPMENT, CHART_STATUS)
 
-# Claves de las graficas de tags instalados.
-CHART_TAG_MONTH = "tag_month"
+# Claves de las graficas de tags instalados. Las dos primeras son series de
+# tiempo y respetan la granularidad elegida (dia, semana, mes o ano).
+CHART_TAG_INSTALLED = "tag_installed"
 CHART_TAG_TYPE = "tag_type"
 CHART_TAG_DEPT = "tag_dept"
-CHART_TAG_WEEK = "tag_week"
-TAG_CHARTS = (CHART_TAG_MONTH, CHART_TAG_TYPE, CHART_TAG_DEPT, CHART_TAG_WEEK)
+TAG_CHARTS = (CHART_TAG_INSTALLED, CHART_TAG_TYPE, CHART_TAG_DEPT)
 
 
 def _pct_formatter(value, _pos=None) -> str:
@@ -120,18 +120,21 @@ class ChartCanvas(FigureCanvasQTAgg):
         self.draw()
 
     @staticmethod
-    def _month_ticks(ax, months):
-        """Etiquetas de mes rotadas y, si son muchas, salteadas.
+    def _period_ticks(ax, periods, grain=analytics.GRAIN_MONTH):
+        """Etiquetas de tiempo rotadas y, si son muchas, salteadas.
 
-        Con 24 meses las etiquetas se pisan; mostrar una de cada dos es peor
+        Con 24 cubetas las etiquetas se pisan; mostrar una de cada dos es peor
         que rotarlas, porque el ojo pierde la referencia de que barra es cual.
-        Por eso se rotan siempre y solo se saltea a partir de 30 meses.
+        Por eso se rotan siempre y solo se saltea a partir de 30.
         """
-        step = 1 if len(months) <= 30 else 2
-        ax.set_xticks(range(0, len(months), step))
-        ax.set_xticklabels([i18n.month_label(months[i])
-                            for i in range(0, len(months), step)],
+        step = max(1, (len(periods) + 29) // 30)
+        ax.set_xticks(range(0, len(periods), step))
+        ax.set_xticklabels([i18n.period_label(periods[i], grain)
+                            for i in range(0, len(periods), step)],
                            rotation=60, ha="right", fontsize=7.5)
+
+    def _month_ticks(self, ax, months):
+        self._period_ticks(ax, months, analytics.GRAIN_MONTH)
 
     # =======================================================================
     # Tablero de mantenimiento
@@ -265,8 +268,17 @@ class ChartCanvas(FigureCanvasQTAgg):
     # =======================================================================
     # Tags instalados por semana
     # =======================================================================
-    def tag_month_bars(self, rows):
-        """SMU y TAG instalados por mes, uno al lado del otro."""
+    @staticmethod
+    def _period_caption(total, trimmed):
+        caption = i18n.t("chart.caption_total", n=i18n.fmt_number(total))
+        if trimmed:
+            caption += "   ·   " + i18n.t("chart.caption_last_periods",
+                                          n=trimmed)
+        return caption
+
+    def tag_installed_bars(self, rows, grain=analytics.GRAIN_MONTH,
+                           trimmed=0):
+        """SMU y TAG instalados por cubeta de tiempo, uno al lado del otro."""
         ax = self._fresh()
         rows = list(rows or [])
         if not rows or not any(r.total for r in rows):
@@ -282,53 +294,35 @@ class ChartCanvas(FigureCanvasQTAgg):
                color=p["tag"], label=i18n.t("chart.legend_tag"))
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_ylabel(i18n.t("chart.axis_count"), fontsize=9)
-        self._month_ticks(ax, [r.month for r in rows])
-        self._title(ax, i18n.t("tags.chart_month"),
-                    i18n.t("chart.caption_total",
-                           n=i18n.fmt_number(sum(r.total for r in rows))))
+        self._period_ticks(ax, [r.period for r in rows], grain)
+        self._title(ax, "%s — %s" % (i18n.t("tags.chart_installed"),
+                                     i18n.t("grain." + grain)),
+                    self._period_caption(sum(r.total for r in rows), trimmed))
         self._legend(ax, loc="upper left", ncol=2)
         self._done(ax)
 
-    def tag_move_bars(self, months, series):
-        """Movimientos por mes apilados por tipo (alta, reemplazo, retiro)."""
+    def tag_move_bars(self, periods, series, grain=analytics.GRAIN_MONTH,
+                      trimmed=0):
+        """Movimientos apilados por tipo (alta, reemplazo, retiro)."""
         ax = self._fresh()
-        if not months or not series:
+        if not periods or not series:
             self._empty(ax)
             return
 
-        bottom = [0] * len(months)
+        bottom = [0] * len(periods)
+        total = 0
         for move, values in series.items():
-            ax.bar(range(len(months)), values, 0.62, bottom=bottom,
+            ax.bar(range(len(periods)), values, 0.62, bottom=bottom,
                    color=theme.move_color(move), label=i18n.tr_value(move))
             bottom = [b + v for b, v in zip(bottom, values)]
+            total += sum(values)
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_ylabel(i18n.t("chart.axis_count"), fontsize=9)
-        self._month_ticks(ax, months)
-        self._title(ax, i18n.t("tags.chart_type"))
+        self._period_ticks(ax, periods, grain)
+        self._title(ax, "%s — %s" % (i18n.t("tags.chart_type"),
+                                     i18n.t("grain." + grain)),
+                    self._period_caption(total, trimmed))
         self._legend(ax, loc="upper left", ncol=2)
-        self._done(ax)
-
-    def tag_week_bars(self, items):
-        """Instalados por semana (lunes de cada semana)."""
-        ax = self._fresh()
-        items = list(items or [])
-        if not items:
-            self._empty(ax)
-            return
-
-        p = theme.palette()
-        values = [n for _monday, n in items]
-        ax.bar(range(len(items)), values, 0.7, color=p["install"])
-        step = 1 if len(items) <= 16 else max(1, len(items) // 14)
-        ax.set_xticks(range(0, len(items), step))
-        ax.set_xticklabels([items[i][0].strftime("%d/%m/%y")
-                            for i in range(0, len(items), step)],
-                           rotation=60, ha="right", fontsize=7.5)
-        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-        ax.set_ylabel(i18n.t("chart.axis_count"), fontsize=9)
-        self._title(ax, i18n.t("tags.chart_week"),
-                    i18n.t("chart.caption_total",
-                           n=i18n.fmt_number(sum(values))))
         self._done(ax)
 
 
@@ -353,16 +347,31 @@ def render_maintenance(canvas: ChartCanvas, key: str, pivot, kpis,
         canvas.reviewed_bars(kpis)
 
 
-def render_tags(canvas: ChartCanvas, key: str, movements) -> None:
-    if key == CHART_TAG_TYPE:
-        months, series = analytics.tag_by_move_type(movements)
-        canvas.tag_move_bars(months, series)
-    elif key == CHART_TAG_DEPT:
+def render_tags(canvas: ChartCanvas, key: str, movements,
+                grain: str = analytics.GRAIN_MONTH, limit: int = 0) -> None:
+    """Dibuja la grafica pedida de la pestana de tags.
+
+    `limit` recorta a las ultimas N cubetas. Es necesario en el grano diario:
+    dos anos de datos son mas de setecientas barras de un pixel.
+    """
+    if key == CHART_TAG_DEPT:
         canvas.category_bars(
             analytics.count_by(movements, "department", top=12,
                                other_label=i18n.t("chart.other")),
             i18n.t("tags.chart_dept"))
-    elif key == CHART_TAG_WEEK:
-        canvas.tag_week_bars(analytics.tag_weekly(movements))
-    else:
-        canvas.tag_month_bars(analytics.tag_monthly(movements))
+        return
+
+    if key == CHART_TAG_TYPE:
+        periods, series = analytics.tag_by_move_type(movements, grain)
+        totals = [sum(values[i] for values in series.values())
+                  for i in range(len(periods))]
+        cut = analytics.focus_periods(totals, limit, lambda n: not n)
+        canvas.tag_move_bars(periods[cut:],
+                             {m: v[cut:] for m, v in series.items()},
+                             grain, len(periods) - cut if cut else 0)
+        return
+
+    rows = analytics.tag_by_period(movements, grain)
+    cut = analytics.focus_periods(rows, limit, lambda r: not r.total)
+    canvas.tag_installed_bars(rows[cut:], grain,
+                              len(rows) - cut if cut else 0)

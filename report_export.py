@@ -482,26 +482,46 @@ def _sheet_tag_data(wb, movements: list) -> None:
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
 
 
-def _sheet_tag_summary(wb, rows: list) -> None:
+def _sheet_tag_summary(wb, rows: list, grain: str) -> None:
+    """Resumen de instalacion por la granularidad elegida.
+
+    Con grano mensual se conserva el par Ano | Mes del consolidado del cliente;
+    con los otros granos una sola columna de periodo dice mas (un 'ano' repetido
+    en 365 filas diarias no aporta nada).
+    """
     ws = wb.create_sheet(i18n.t("sheet.tagsummary"))
-    row = _title(ws, 1, i18n.t("xls.title_tagsummary"),
+    row = _title(ws, 1, "%s — %s" % (i18n.t("xls.title_tagsummary"),
+                                     i18n.t("grain." + grain)),
                  i18n.t("xls.generated", when=_stamp()))
     header_row = row
-    _headers(ws, header_row,
-             [i18n.t("col.year"), i18n.t("col.month"), "SMU", "TAG",
-              i18n.t("col.total"), i18n.tr_value(tag_reader.MOVE_REMOVAL)],
-             [8, 10, 9, 9, 10, 12])
+    by_month = grain == analytics.GRAIN_MONTH
+    labels = ([i18n.t("col.year"), i18n.t("col.month")] if by_month
+              else [i18n.t("grain.col_" + grain)])
+    labels += ["SMU", "TAG", i18n.t("col.total"),
+               i18n.tr_value(tag_reader.MOVE_REMOVAL)]
+    _headers(ws, header_row, labels,
+             ([8, 10] if by_month else [14]) + [9, 9, 10, 12])
 
+    first_data_col = 3 if by_month else 2
     for offset, item in enumerate(rows, start=1):
         r = header_row + offset
-        day = analytics.month_date(item.month)
-        ws.cell(row=r, column=1, value=day.year if day else None)
-        ws.cell(row=r, column=2,
-                value=i18n.month_short(day.month) if day else item.month)
-        ws.cell(row=r, column=3, value=item.smu)
-        ws.cell(row=r, column=4, value=item.tag)
-        ws.cell(row=r, column=5, value=item.total).font = Font(bold=True)
-        ws.cell(row=r, column=6, value=item.removals)
+        day = item.date
+        if by_month:
+            ws.cell(row=r, column=1, value=day.year if day else None)
+            ws.cell(row=r, column=2,
+                    value=i18n.month_short(day.month) if day else item.period)
+        elif grain == analytics.GRAIN_YEAR:
+            ws.cell(row=r, column=1, value=day.year if day else item.period)
+        else:
+            # Dia y semana van como fecha real para que Excel las ordene y las
+            # pueda agrupar en una dinamica propia.
+            cell = ws.cell(row=r, column=1, value=day)
+            cell.number_format = _DATE_FORMAT
+        ws.cell(row=r, column=first_data_col, value=item.smu)
+        ws.cell(row=r, column=first_data_col + 1, value=item.tag)
+        ws.cell(row=r, column=first_data_col + 2,
+                value=item.total).font = Font(bold=True)
+        ws.cell(row=r, column=first_data_col + 3, value=item.removals)
 
     last_row = header_row + len(rows)
     if last_row <= header_row:
@@ -510,25 +530,34 @@ def _sheet_tag_summary(wb, rows: list) -> None:
     chart = BarChart()
     chart.type = "col"
     chart.grouping = "clustered"
-    chart.title = i18n.t("xls.chart_taginstalled")
+    chart.title = "%s — %s" % (i18n.t("xls.chart_taginstalled"),
+                               i18n.t("grain." + grain))
     chart.y_axis.title = i18n.t("xls.axis_count")
-    chart.x_axis.title = i18n.t("xls.axis_month")
-    data = Reference(ws, min_col=3, max_col=4, min_row=header_row,
-                     max_row=last_row)
-    cats = Reference(ws, min_col=2, max_col=2, min_row=header_row + 1,
-                     max_row=last_row)
+    chart.x_axis.title = i18n.t("grain.col_" + grain)
+    data = Reference(ws, min_col=first_data_col, max_col=first_data_col + 1,
+                     min_row=header_row, max_row=last_row)
+    label_col = 2 if by_month else 1
+    cats = Reference(ws, min_col=label_col, max_col=label_col,
+                     min_row=header_row + 1, max_row=last_row)
     chart.add_data(data, titles_from_data=True)
     _text_categories(chart, cats)
     chart.height, chart.width = 11.0, 26.0
-    ws.add_chart(chart, "H%d" % (header_row + 1))
+    ws.add_chart(chart, "%s%d" % (get_column_letter(first_data_col + 5),
+                                  header_row + 1))
 
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
 
 
-def export_tags(path: str, movements: list, progress_cb=None) -> str:
-    """Escribe el consolidado de tags instalados y devuelve la ruta."""
+def export_tags(path: str, movements: list,
+                grain: str = analytics.GRAIN_MONTH, progress_cb=None) -> str:
+    """Escribe el consolidado de tags instalados y devuelve la ruta.
+
+    `grain` agrupa el resumen por dia, semana, mes o ano. La tabla de
+    movimientos no cambia: es el detalle, y ahi cada fila es un movimiento.
+    """
     movements = list(movements or [])
-    monthly = analytics.tag_monthly(movements)
+    grain = grain if grain in analytics.GRAINS else analytics.GRAIN_MONTH
+    summary = analytics.tag_by_period(movements, grain)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -537,7 +566,7 @@ def export_tags(path: str, movements: list, progress_cb=None) -> str:
     _sheet_tag_data(wb, movements)
     if progress_cb:
         progress_cb(2, 2, i18n.t("sheet.tagsummary"))
-    _sheet_tag_summary(wb, monthly)
+    _sheet_tag_summary(wb, summary, grain)
 
     undated = sum(1 for m in movements if not m.get("date"))
     notes = [i18n.t("note.tags"), i18n.t("note.tags_device"),

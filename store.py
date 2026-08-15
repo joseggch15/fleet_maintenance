@@ -263,6 +263,38 @@ def _existing_occurrences(conn) -> dict:
     return counts
 
 
+def inspection_key_counts() -> dict:
+    """{huella: cuantas filas hay} de toda la base.
+
+    La interfaz lo usa para marcar, ANTES de escribir, cuales filas del archivo
+    ya estan cargadas. La base se defiende sola de la doble carga, pero el
+    Excel maestro no: ahi hay que avisarle al usuario antes, no despues.
+    """
+    conn = connect()
+    try:
+        return _existing_occurrences(conn)
+    finally:
+        conn.close()
+
+
+def count_new(records: list, known: dict) -> list:
+    """Marca cada registro como nuevo (True) o ya conocido (False).
+
+    `known` es un {huella: cuantas} como el que devuelve
+    `inspection_key_counts`. Se cuenta por repeticion, no por presencia: si el
+    archivo trae tres inspecciones identicas y ya hay dos cargadas, la tercera
+    es nueva. `known` se consume, asi que la misma llamada puede cruzar contra
+    varias fuentes encadenando el resultado.
+    """
+    seen = {}
+    flags = []
+    for record in records or []:
+        base = inspection_base_key(record)
+        seen[base] = seen.get(base, 0) + 1
+        flags.append(seen[base] > known.get(base, 0))
+    return flags
+
+
 def add_inspections(records: list, progress_cb=None) -> dict:
     """Inserta registros nuevos. Los repetidos se omiten en silencio."""
     records = [r for r in (records or []) if r]

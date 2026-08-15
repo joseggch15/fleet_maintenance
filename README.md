@@ -72,6 +72,32 @@ veces el mismo día por la misma persona— sí se conservan las dos: la dinámi
 cuenta inspecciones y colapsarlas cambiaría el número que se le reporta al
 cliente.
 
+### Volver a descargar el export del formulario
+
+El export `merian_ops_-_form_-_fleet_maintenance_submissions.xlsx` es
+**acumulativo**: cada descarga trae otra vez todo lo anterior más lo nuevo. Al
+cargarlo, el software cruza fila por fila contra dos lugares y lo muestra en la
+columna **Estado** de la previsualización:
+
+| Estado | Qué significa | Casilla *Incluir* |
+|---|---|---|
+| **Nueva** | No está ni en la base local ni en el maestro | marcada |
+| **Ya en la base** | La misma inspección ya fue guardada | desmarcada |
+| **Ya en el maestro** | Está en `Full List 2024-2025` del destino, aunque no en la base | desmarcada |
+
+Es decir: si vuelve a bajar el Excel con 200 submissions viejas y 58 nuevas,
+quedan marcadas **sólo las 58**. Puede volver a marcar lo que quiera —el
+software no decide por usted— pero si carga al maestro con filas ya cargadas,
+avisa cuántas se duplicarían y pide confirmación antes de escribir.
+
+La lectura del maestro se hace una sola vez por archivo (se guarda con su fecha
+de modificación) y se puede repetir con **Volver a revisar duplicados**.
+
+La diferencia con la base local es a propósito: la base **se defiende sola** y
+nunca duplica, mientras que el maestro recibe lo que se le marque. Ahí manda el
+usuario, que puede tener una razón para cargar una fila dos veces; lo que el
+software garantiza es que no pase sin que se dé cuenta.
+
 ### 3. Tablero
 
 Reproduce el bloque de indicadores de `PIVOT SUMMARY 2025`:
@@ -116,6 +142,21 @@ tocar el origen:
 
 Los conteos de instalación excluyen los retiros, igual que el
 `=SUMPRODUCT(... <>"REMOVAL")` del consolidado del cliente.
+
+**Agrupar por** — los archivos llegan por semana, pero la pregunta cambia con
+quien pregunta. El selector **Diario / Semanal / Mensual / Anual** reagrupa las
+gráficas y el resumen del Excel exportado; la tabla de movimientos no cambia,
+porque es el detalle y ahí cada fila es un movimiento.
+
+- Con grano **mensual** el resumen conserva el par `Año | Mes` del consolidado
+  del cliente; con los otros usa una sola columna de período, y el día y la
+  semana van como **fecha real** para poder ordenarlos y armar una dinámica en
+  Excel.
+- En pantalla la gráfica muestra las últimas cubetas **con datos** (45 días, 30
+  semanas, 36 meses) y no las últimas a secas. La diferencia importa con estos
+  archivos: hay movimientos fechados en 2027 por un error de tipeo, y contando
+  hacia atrás desde ahí las 30 últimas semanas caerían todas dentro del hueco.
+  Los huecos intermedios se conservan — son justamente lo que delata el error.
 
 ### 5. Exportar
 
@@ -188,10 +229,10 @@ editables en la previsualización.
   inspección en campo); si falta, se cae a `Submitted At`.
 - **Horas/ODO**: se usa el `Machine Hourmeter Reading`; si está vacío, el
   `Machine Kilometer Reading`.
-- **Duplicados al escribir en el maestro**: la herramienta **agrega todas** las
-  filas marcadas. La deduplicación es de la base local, no del maestro; si se
-  re-importa el mismo export al Excel se duplican filas, así que importe sólo
-  submissions nuevas o desmarque las ya cargadas.
+- **Duplicados al escribir en el maestro**: la herramienta agrega las filas
+  marcadas, y las que ya están cargadas llegan **desmarcadas** desde la
+  previsualización (ver *Volver a descargar el export del formulario*). Si aun
+  así se marcan, el software avisa cuántas se duplicarían antes de escribir.
 
 ## Cómo se preserva la estructura del maestro
 

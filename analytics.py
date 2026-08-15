@@ -91,6 +91,119 @@ def year_months(months: list, year) -> list:
     return [m for m in months or [] if m.startswith(prefix)]
 
 
+# ---------------------------------------------------------------------------
+# Granularidad de tiempo
+# ---------------------------------------------------------------------------
+#
+# Los archivos de tags llegan por semana, pero la pregunta que se le hace a los
+# datos cambia con quien pregunta: el supervisor quiere el dia, el reporte
+# mensual quiere el mes y la gerencia quiere el ano. El agrupador es el mismo
+# para las cuatro; lo unico que cambia es a que cubeta cae cada fecha.
+GRAIN_DAY = "day"
+GRAIN_WEEK = "week"
+GRAIN_MONTH = "month"
+GRAIN_YEAR = "year"
+GRAINS = (GRAIN_DAY, GRAIN_WEEK, GRAIN_MONTH, GRAIN_YEAR)
+
+
+def period_key(value, grain: str = GRAIN_MONTH) -> str:
+    """Fecha -> clave de la cubeta.
+
+    Dia y semana usan una fecha ISO (la semana, la de su lunes); mes usa
+    'AAAA-MM' y ano 'AAAA'. Todas ordenan alfabeticamente igual que
+    cronologicamente, que es lo que permite ordenar sin convertir.
+    """
+    day = value if isinstance(value, datetime.date) else None
+    if day is None:
+        if value in (None, ""):
+            return ""
+        if isinstance(value, datetime.datetime):
+            day = value.date()
+        else:
+            text = str(value).strip()
+            try:
+                day = datetime.date.fromisoformat(text[:10])
+            except ValueError:
+                return ""
+    if isinstance(day, datetime.datetime):
+        day = day.date()
+
+    if grain == GRAIN_DAY:
+        return day.isoformat()
+    if grain == GRAIN_WEEK:
+        return (day - datetime.timedelta(days=day.weekday())).isoformat()
+    if grain == GRAIN_YEAR:
+        return "%04d" % day.year
+    return "%04d-%02d" % (day.year, day.month)
+
+
+def period_date(key: str, grain: str = GRAIN_MONTH):
+    """Clave de cubeta -> date con el que empieza (para ejes y para Excel)."""
+    if not key:
+        return None
+    try:
+        if grain == GRAIN_YEAR:
+            return datetime.date(int(key), 1, 1)
+        if grain == GRAIN_MONTH:
+            return datetime.date(int(key[:4]), int(key[5:7]), 1)
+        return datetime.date.fromisoformat(key)
+    except (ValueError, IndexError):
+        return None
+
+
+def period_range(first: str, last: str, grain: str = GRAIN_MONTH) -> list:
+    """Todas las cubetas entre dos claves, incluidas las vacias.
+
+    El hueco es informacion —una semana sin una sola instalacion dice algo— y
+    si se omitiera, la grafica haria parecer consecutivas dos cubetas que estan
+    a medio ano de distancia.
+    """
+    start, end = period_date(first, grain), period_date(last, grain)
+    if start is None or end is None or start > end:
+        return []
+    if grain == GRAIN_MONTH:
+        return month_range(first, last)
+
+    keys = []
+    if grain == GRAIN_YEAR:
+        return ["%04d" % y for y in range(start.year, end.year + 1)]
+    step = datetime.timedelta(days=7 if grain == GRAIN_WEEK else 1)
+    current = start
+    while current <= end:
+        keys.append(current.isoformat())
+        current += step
+    return keys
+
+
+def last_periods(rows: list, count: int) -> list:
+    """Las ultimas `count` cubetas. Con 0 o None devuelve todas."""
+    rows = list(rows or [])
+    return rows[-count:] if count and count < len(rows) else rows
+
+
+def focus_periods(rows: list, count: int, is_empty, span: int = 3) -> int:
+    """Desde que indice conviene graficar. Devuelve el corte.
+
+    Cortar por las ultimas `count` cubetas a secas funciona mal cuando hay un
+    dato suelto muy adelantado: los archivos semanales del cliente traen filas
+    fechadas en 2027 por un error de tipeo, y con grano semanal las ultimas 30
+    cubetas caen todas dentro de ese hueco — una grafica vacia con una barra al
+    final.
+
+    Se cuentan entonces las ultimas `count` cubetas CON datos y se muestra
+    desde la primera de ellas, conservando los huecos intermedios (el hueco es
+    justamente lo que delata el error). El tope de `span * count` evita el
+    extremo contrario: que un dato de hace tres anos estire el eje.
+    """
+    rows = list(rows or [])
+    if not count or len(rows) <= count:
+        return 0
+    filled = [i for i, row in enumerate(rows) if not is_empty(row)]
+    start = filled[-count] if len(filled) > count else (
+        filled[0] if filled else len(rows) - count)
+    return max(min(start, len(rows) - count), len(rows) - span * count, 0)
+
+
 def _natural_key(label: str):
     """Orden 'humano' de los IDs de equipo: 3, 10, 127, C-155, LVE0198.
 
@@ -274,8 +387,9 @@ def count_by(inspections: list, field_name: str, top: int = 0,
 # Resumen de los movimientos de tag
 # ---------------------------------------------------------------------------
 @dataclass
-class TagMonth:
-    month: str
+class TagPeriod:
+    period: str           # clave de la cubeta
+    grain: str = GRAIN_MONTH
     smu: int = 0
     tag: int = 0
     removals: int = 0
@@ -284,14 +398,19 @@ class TagMonth:
     def total(self) -> int:
         return self.smu + self.tag
 
+    @property
+    def date(self):
+        return period_date(self.period, self.grain)
 
-def tag_monthly(movements: list, months: list = None) -> list:
-    """Instalados por mes, separados en SMU y TAG.
+
+def tag_by_period(movements: list, grain: str = GRAIN_MONTH,
+                  periods: list = None) -> list:
+    """Instalados por cubeta de tiempo, separados en SMU y TAG.
 
     'Instalado' excluye los retiros, igual que el =SUMPRODUCT(... <>"REMOVAL")
     del consolidado. Los retiros se llevan aparte en `removals` porque tambien
-    hay que verlos: un mes con muchas altas y muchas bajas no es lo mismo que
-    un mes de crecimiento.
+    hay que verlos: un periodo con muchas altas y muchas bajas no es lo mismo
+    que uno de crecimiento.
     """
     smu = collections.Counter()
     tag = collections.Counter()
@@ -299,57 +418,43 @@ def tag_monthly(movements: list, months: list = None) -> list:
     seen = set()
 
     for row in movements or []:
-        month = month_key(row.get("date"))
-        if not month:
+        key = period_key(row.get("date"), grain)
+        if not key:
             continue
-        seen.add(month)
+        seen.add(key)
         move = str(row.get("move_type") or "").strip().upper()
         if move == tag_reader.MOVE_REMOVAL:
-            removed[month] += 1
+            removed[key] += 1
             continue
         if str(row.get("device_type") or "").strip().upper() == \
                 tag_reader.DEVICE_SMU:
-            smu[month] += 1
+            smu[key] += 1
         else:
-            tag[month] += 1
+            tag[key] += 1
 
-    keys = list(months) if months is not None else (
-        month_range(min(seen), max(seen)) if seen else [])
-    return [TagMonth(month=m, smu=smu[m], tag=tag[m], removals=removed[m])
-            for m in keys]
+    keys = list(periods) if periods is not None else (
+        period_range(min(seen), max(seen), grain) if seen else [])
+    return [TagPeriod(period=k, grain=grain, smu=smu[k], tag=tag[k],
+                      removals=removed[k]) for k in keys]
 
 
-def tag_by_move_type(movements: list) -> tuple:
-    """(meses, {tipo_de_movimiento: [cuentas por mes]}) para la grafica apilada."""
+def tag_by_move_type(movements: list, grain: str = GRAIN_MONTH) -> tuple:
+    """(cubetas, {movimiento: [cuentas]}) para la grafica apilada."""
     counts = collections.Counter()
     seen = set()
     for row in movements or []:
-        month = month_key(row.get("date"))
-        if not month:
+        key = period_key(row.get("date"), grain)
+        if not key:
             continue
-        seen.add(month)
+        seen.add(key)
         move = str(row.get("move_type") or "").strip().upper()
         counts[(move if move in tag_reader.MOVE_TYPES
-                else tag_reader.MOVE_NEW, month)] += 1
-    months = month_range(min(seen), max(seen)) if seen else []
-    series = {move: [counts.get((move, m), 0) for m in months]
+                else tag_reader.MOVE_NEW, key)] += 1
+    periods = period_range(min(seen), max(seen), grain) if seen else []
+    series = {move: [counts.get((move, k), 0) for k in periods]
               for move in tag_reader.MOVE_TYPES
-              if any(counts.get((move, m), 0) for m in months)}
-    return months, series
-
-
-def tag_weekly(movements: list, weeks: int = 26) -> list:
-    """[(lunes, instalados)] de las ultimas `weeks` semanas con movimiento."""
-    counter = collections.Counter()
-    for row in movements or []:
-        move = str(row.get("move_type") or "").strip().upper()
-        if move == tag_reader.MOVE_REMOVAL:
-            continue
-        monday = tag_reader.week_monday(row.get("date"))
-        if monday:
-            counter[monday] += 1
-    items = sorted(counter.items())
-    return items[-weeks:] if weeks and len(items) > weeks else items
+              if any(counts.get((move, k), 0) for k in periods)}
+    return periods, series
 
 
 def tag_totals(movements: list) -> dict:

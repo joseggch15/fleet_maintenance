@@ -129,6 +129,29 @@ def month_label(value) -> str:
     return "%s-%02d" % (month_short(month), year % 100)
 
 
+def period_label(key, grain: str = "month") -> str:
+    """Etiqueta de una cubeta de tiempo segun su granularidad.
+
+      dia     05/08/26
+      semana  05/08/26   (el lunes de esa semana)
+      mes     ago-26
+      ano     2026
+
+    El dia y la semana llevan la fecha corta y no el nombre del mes: en una
+    grafica diaria lo que se necesita distinguir es el dia, y 'ago-26' repetido
+    treinta veces no distingue nada.
+    """
+    if grain == "year":
+        return str(key)[:4]
+    if grain in ("day", "week"):
+        try:
+            day = datetime.date.fromisoformat(str(key)[:10])
+        except ValueError:
+            return str(key)
+        return day.strftime("%d/%m/%y")
+    return month_label(key)
+
+
 def fmt_date(value) -> str:
     if value in (None, ""):
         return ""
@@ -252,6 +275,26 @@ _UI = {
             "and 'Verified' (D) columns are formulas and recalculate on their "
             "own; they are not shown here."},
     "import.col_include": {ES: "Incluir", EN: "Include"},
+    "import.col_state": {ES: "Estado", EN: "State"},
+    "import.state_new": {ES: "Nueva", EN: "New"},
+    "import.state_stored": {ES: "Ya en la base", EN: "Already in database"},
+    "import.state_master": {ES: "Ya en el maestro", EN: "Already in master"},
+    "import.dupes": {
+        ES: "{n} fila(s) del archivo ya estaban cargadas y se desmarcaron. "
+            "Quedan {new} nuevas marcadas.",
+        EN: "{n} row(s) in the file were already loaded and were unchecked. "
+            "{new} new rows stay checked."},
+    "import.dupes_none": {
+        ES: "Ninguna fila del archivo estaba cargada: las {new} son nuevas.",
+        EN: "No row in the file was already loaded: all {new} are new."},
+    "import.btn_recheck": {ES: "Volver a revisar duplicados",
+                           EN: "Re-check duplicates"},
+    "import.confirm_dupes": {
+        ES: "De las {n} fila(s) marcadas, {dupes} ya estan cargadas y se "
+            "agregarian por segunda vez al maestro.\n\n Continuar de todos "
+            "modos?",
+        EN: "Of the {n} checked row(s), {dupes} are already loaded and would "
+            "be added to the master a second time.\n\nContinue anyway?"},
     "import.check_all": {ES: "Marcar todas", EN: "Check all"},
     "import.uncheck_all": {ES: "Desmarcar todas", EN: "Uncheck all"},
     "import.count": {ES: "{n} submissions cargadas.",
@@ -377,13 +420,25 @@ _UI = {
     "tags.rows": {ES: "{shown} de {total} movimientos",
                   EN: "{shown} of {total} movements"},
     "tags.chart": {ES: "Grafica:", EN: "Chart:"},
-    "tags.chart_month": {ES: "Instalados por mes (SMU / TAG)",
-                         EN: "Installed per month (SMU / TAG)"},
-    "tags.chart_type": {ES: "Movimientos por mes y tipo",
-                        EN: "Movements per month and type"},
+    "tags.chart_installed": {ES: "Instalados (SMU / TAG)",
+                             EN: "Installed (SMU / TAG)"},
+    "tags.chart_type": {ES: "Movimientos por tipo",
+                        EN: "Movements by type"},
     "tags.chart_dept": {ES: "Instalados por departamento",
                         EN: "Installed by department"},
-    "tags.chart_week": {ES: "Instalados por semana", EN: "Installed per week"},
+
+    # -- granularidad ------------------------------------------------------
+    "grain.label": {ES: "Agrupar por:", EN: "Group by:"},
+    "grain.day": {ES: "Diario", EN: "Daily"},
+    "grain.week": {ES: "Semanal", EN: "Weekly"},
+    "grain.month": {ES: "Mensual", EN: "Monthly"},
+    "grain.year": {ES: "Anual", EN: "Annual"},
+    "grain.col_day": {ES: "Dia", EN: "Day"},
+    "grain.col_week": {ES: "Semana (lunes)", EN: "Week (Monday)"},
+    "grain.col_month": {ES: "Mes", EN: "Month"},
+    "grain.col_year": {ES: "Ano", EN: "Year"},
+    "chart.caption_last_periods": {ES: "se muestran las ultimas {n} cubetas",
+                                   EN: "showing the last {n} buckets"},
     "tags.card_total": {ES: "Movimientos", EN: "Movements"},
     "tags.card_total_hint": {ES: "filas almacenadas", EN: "stored rows"},
     "tags.card_installed": {ES: "Instalados", EN: "Installed"},

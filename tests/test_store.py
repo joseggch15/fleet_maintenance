@@ -52,6 +52,35 @@ def test_genuine_repeats_are_kept(temp_store):
     assert temp_store.add_inspections([row, dict(row)])["added"] == 0
 
 
+def test_count_new_flags_only_what_is_missing(temp_store):
+    """El export del formulario es acumulativo: trae lo viejo mas lo nuevo."""
+    old = temp_store.inspection_from_row(
+        _row(datetime.datetime(2026, 5, 15), 836), "MOFFM-1")
+    temp_store.add_inspections([old])
+
+    new = temp_store.inspection_from_row(
+        _row(datetime.datetime(2026, 7, 9), 829), "MOFFM-2")
+    flags = temp_store.count_new([old, new],
+                                 temp_store.inspection_key_counts())
+    assert flags == [False, True]
+
+
+def test_count_new_counts_repeats_one_by_one(temp_store):
+    """Si el archivo trae tres iguales y hay dos cargadas, falta una."""
+    row = temp_store.inspection_from_row(
+        _row(datetime.datetime(2026, 5, 15), 836))
+    temp_store.add_inspections([row, dict(row)])
+    flags = temp_store.count_new([row, dict(row), dict(row)],
+                                 temp_store.inspection_key_counts())
+    assert flags == [False, False, True]
+
+
+def test_count_new_with_an_empty_database(temp_store):
+    row = temp_store.inspection_from_row(
+        _row(datetime.datetime(2026, 5, 15), 836))
+    assert temp_store.count_new([row], {}) == [True]
+
+
 def test_filters_by_year_owner_and_search(temp_store):
     temp_store.add_inspections([
         temp_store.inspection_from_row(_row(datetime.datetime(2025, 4, 2), 829)),

@@ -144,14 +144,57 @@ def test_count_by_groups_the_tail():
 # ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
-def test_tag_monthly_excludes_removals_from_installed():
+def test_tag_by_period_excludes_removals_from_installed():
     rows = [
         _move("2026-06-01", "CA:CC:A3:FA:4C:2B"),
         _move("2026-06-02", "56B2D9A6"),
         _move("2026-06-03", "56B36ACF", tag_reader.MOVE_REMOVAL),
     ]
-    month = analytics.tag_monthly(rows)[0]
+    month = analytics.tag_by_period(rows)[0]
     assert (month.smu, month.tag, month.total, month.removals) == (1, 1, 2, 1)
+
+
+def test_tag_by_period_groups_by_each_grain():
+    rows = [_move("2026-06-01", "A"), _move("2026-06-03", "B"),
+            _move("2026-07-15", "C")]
+    counts = {g: len(analytics.tag_by_period(rows, g))
+              for g in analytics.GRAINS}
+    # Del 1 de junio al 15 de julio: 45 dias, 7 semanas, 2 meses, 1 ano.
+    assert counts[analytics.GRAIN_DAY] == 45
+    assert counts[analytics.GRAIN_WEEK] == 7
+    assert counts[analytics.GRAIN_MONTH] == 2
+    assert counts[analytics.GRAIN_YEAR] == 1
+    for grain in analytics.GRAINS:
+        assert sum(p.total for p in analytics.tag_by_period(rows, grain)) == 3
+
+
+def test_week_grain_falls_on_monday():
+    # El 3 de junio de 2026 es miercoles: su cubeta es la del lunes 1.
+    assert analytics.period_key(
+        "2026-06-03", analytics.GRAIN_WEEK) == "2026-06-01"
+
+
+def test_period_key_per_grain():
+    day = "2026-06-03"
+    assert analytics.period_key(day, analytics.GRAIN_DAY) == day
+    assert analytics.period_key(day, analytics.GRAIN_MONTH) == "2026-06"
+    assert analytics.period_key(day, analytics.GRAIN_YEAR) == "2026"
+    assert analytics.period_key("", analytics.GRAIN_DAY) == ""
+
+
+def test_period_range_keeps_empty_buckets():
+    assert analytics.period_range(
+        "2026", "2028", analytics.GRAIN_YEAR) == ["2026", "2027", "2028"]
+    assert len(analytics.period_range("2026-06-01", "2026-06-22",
+                                      analytics.GRAIN_WEEK)) == 4
+
+
+def test_last_periods():
+    rows = analytics.tag_by_period([_move("2026-06-01", "A"),
+                                    _move("2026-08-01", "B")])
+    assert len(rows) == 3
+    assert len(analytics.last_periods(rows, 2)) == 2
+    assert len(analytics.last_periods(rows, 0)) == 3
 
 
 def test_tag_by_move_type_only_returns_used_types():
@@ -162,11 +205,12 @@ def test_tag_by_move_type_only_returns_used_types():
     assert set(series) == {tag_reader.MOVE_NEW, tag_reader.MOVE_REMOVAL}
 
 
-def test_tag_weekly_groups_by_monday():
-    rows = [_move("2026-06-01", "A"), _move("2026-06-03", "B"),
-            _move("2026-06-09", "C")]
-    weeks = analytics.tag_weekly(rows)
-    assert [count for _monday, count in weeks] == [2, 1]
+def test_tag_by_move_type_honours_the_grain():
+    periods, series = analytics.tag_by_move_type(
+        [_move("2026-06-01", "A"), _move("2026-06-09", "B")],
+        analytics.GRAIN_WEEK)
+    assert periods == ["2026-06-01", "2026-06-08"]
+    assert series[tag_reader.MOVE_NEW] == [1, 1]
 
 
 def test_tag_totals():

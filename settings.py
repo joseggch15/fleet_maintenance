@@ -50,6 +50,8 @@ DEFAULTS = {
     "fleet_sizes": dict(DEFAULT_FLEET_SIZES),
     # Cuantos meses muestra el tablero. 0 = todos.
     "dashboard_months": 24,
+    # Granularidad de las graficas y del resumen de tags: day/week/month/year.
+    "tag_grain": "month",
     "backup_target": True,
     "store_on_append": True,
     "last_source_file": "",

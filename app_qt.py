@@ -32,7 +32,7 @@ import sys
 import traceback
 
 from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
@@ -71,6 +71,20 @@ _PREVIEW_LABELS = {
 # miles de filas eso se nota al filtrar. Se muestran las mas recientes y se
 # avisa; los calculos y la exportacion siguen usando todas.
 _TABLE_LIMIT = 2000
+
+# Estado de una fila de la previsualizacion frente a lo ya cargado.
+_STATE_NEW = "new"
+_STATE_STORED = "stored"
+_STATE_MASTER = "master"
+
+# Cuantas cubetas muestra la grafica de tags segun la granularidad. Con dos
+# anos de datos, 'diario' son mas de 700 barras: ni se leen ni sirven.
+_GRAIN_CHART_LIMIT = {
+    analytics.GRAIN_DAY: 45,
+    analytics.GRAIN_WEEK: 30,
+    analytics.GRAIN_MONTH: 36,
+    analytics.GRAIN_YEAR: 0,
+}
 
 
 class _BackgroundWorker(QThread):
@@ -251,6 +265,13 @@ class MainWindow(QMainWindow):
         self.preview_rows = []      # list[dict] {columna: valor}
         self.preview_codes = []     # codigo de submission por fila
         self.preview_checked = []   # list[bool]
+        self.preview_state = []     # 'new' | 'stored' | 'master'
+
+        # Huellas de la hoja 'Full List' del destino, para avisar antes de
+        # duplicar. Se guarda con la ruta y la fecha del archivo: si el maestro
+        # no cambio, no hace falta releer sus miles de filas.
+        self._master_keys = {}
+        self._master_stamp = None
 
         # Cache de la base: se recarga al importar o al borrar, no en cada
         # cambio de filtro ni al cambiar de idioma.
@@ -309,8 +330,9 @@ class MainWindow(QMainWindow):
         deberia hacerle perder el sitio.
         """
         combo_names = ("chart_combo", "tag_chart_combo", "period_combo",
-                       "year_combo", "owner_combo", "tag_year_combo",
-                       "tag_type_combo", "tag_device_combo", "tag_dept_combo")
+                       "grain_combo", "year_combo", "owner_combo",
+                       "tag_year_combo", "tag_type_combo", "tag_device_combo",
+                       "tag_dept_combo")
         state = {
             "tab": self.tabs.currentIndex(),
             "search": self.search_edit.text(),
@@ -443,7 +465,8 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
-        headers = [i18n.t("import.col_include")] + [
+        headers = [i18n.t("import.col_include"),
+                   i18n.t("import.col_state")] + [
             "%s · %s" % (col, i18n.t(_PREVIEW_LABELS[col]))
             for col in PREVIEW_COLUMNS]
         self.table = QTableWidget(0, len(headers))
@@ -462,8 +485,12 @@ class MainWindow(QMainWindow):
         btn_none = QPushButton(i18n.t("import.uncheck_all"))
         btn_none.setObjectName("ghost")
         btn_none.clicked.connect(lambda: self._set_all_checks(False))
+        btn_recheck = QPushButton(i18n.t("import.btn_recheck"))
+        btn_recheck.setObjectName("ghost")
+        btn_recheck.clicked.connect(lambda: self._mark_duplicates(True))
         sel.addWidget(btn_all)
         sel.addWidget(btn_none)
+        sel.addWidget(btn_recheck)
         sel.addStretch(1)
         self.lbl_count = QLabel(i18n.t("import.count", n=0))
         sel.addWidget(self.lbl_count)
@@ -560,7 +587,16 @@ class MainWindow(QMainWindow):
                 box.setAlignment(Qt.AlignCenter)
                 box.addWidget(check)
                 self.table.setCellWidget(row, 0, holder)
-                for col_index, col in enumerate(PREVIEW_COLUMNS, start=1):
+
+                state = (self.preview_state[index]
+                         if index < len(self.preview_state) else _STATE_NEW)
+                label = QTableWidgetItem(i18n.t("import.state_" + state))
+                label.setFlags(label.flags() & ~Qt.ItemIsEditable)
+                label.setForeground(QColor(theme.color(
+                    "accent" if state == _STATE_NEW else "warning")))
+                self.table.setItem(row, 1, label)
+
+                for col_index, col in enumerate(PREVIEW_COLUMNS, start=2):
                     self.table.setItem(
                         row, col_index,
                         QTableWidgetItem(_fmt_cell(rowdata.get(col))))
@@ -585,9 +621,9 @@ class MainWindow(QMainWindow):
         texto convertiria una fecha en cadena y el Excel la escribiria como
         texto, rompiendo la formula 'Date' del maestro.
         """
-        if self._loading or item.column() == 0:
+        if self._loading or item.column() < 2:
             return
-        row, col = item.row(), PREVIEW_COLUMNS[item.column() - 1]
+        row, col = item.row(), PREVIEW_COLUMNS[item.column() - 2]
         if row >= len(self.preview_rows):
             return
         original = self.preview_rows[row].get(col)
@@ -604,6 +640,76 @@ class MainWindow(QMainWindow):
                     parsed.year, parsed.month, parsed.day)
                 return
         self.preview_rows[row][col] = text
+
+    # -- deteccion de duplicados -----------------------------------------
+    def _master_key_counts(self) -> dict:
+        """Huellas de la hoja 'Full List 2024-2025' del Excel destino.
+
+        La base local se defiende sola de la doble carga, pero el maestro no:
+        `append_rows` escribe lo que se le marque. Si el usuario vuelve a bajar
+        el export del formulario —que trae las submissions viejas mas las
+        nuevas— y lo carga entero, el maestro termina con las viejas dos veces.
+        Por eso se leen sus huellas antes de mostrar la previsualizacion.
+        """
+        if not self.target_path or not os.path.exists(self.target_path):
+            return {}
+        try:
+            stamp = (self.target_path, os.path.getmtime(self.target_path))
+        except OSError:
+            return {}
+        if stamp == self._master_stamp:
+            return self._master_keys
+
+        try:
+            rows = _run_with_progress(
+                self, i18n.t("prog.history_title"),
+                i18n.t("prog.history", sheet=source_reader.FULL_LIST_SHEET),
+                source_reader.read_full_list, self.target_path)
+        except Exception:
+            # Un maestro ilegible no puede bloquear la previsualizacion: se
+            # sigue con la comparacion contra la base local solamente.
+            return {}
+
+        counts = {}
+        for row in rows:
+            key = store.inspection_base_key(store.inspection_from_row(row))
+            counts[key] = counts.get(key, 0) + 1
+        self._master_keys = counts
+        self._master_stamp = stamp
+        return counts
+
+    def _mark_duplicates(self, announce: bool = True):
+        """Marca cada fila de la previsualizacion y desmarca las repetidas."""
+        if not self.preview_rows:
+            self.preview_state = []
+            return
+
+        records = [store.inspection_from_row(row, code, self.source_path)
+                   for row, code in zip(self.preview_rows,
+                                        self.preview_codes)]
+        stored = store.count_new(records, store.inspection_key_counts())
+        master = store.count_new(records, self._master_key_counts())
+
+        self.preview_state = []
+        for is_new_here, is_new_there in zip(stored, master):
+            if not is_new_here:
+                self.preview_state.append(_STATE_STORED)
+            elif not is_new_there:
+                self.preview_state.append(_STATE_MASTER)
+            else:
+                self.preview_state.append(_STATE_NEW)
+        self.preview_checked = [state == _STATE_NEW
+                                for state in self.preview_state]
+        self._populate_preview()
+
+        if not announce:
+            return
+        dupes = sum(1 for s in self.preview_state if s != _STATE_NEW)
+        new = len(self.preview_state) - dupes
+        QMessageBox.information(
+            self, i18n.t("dlg.info"),
+            i18n.t("import.dupes", n=dupes, new=new) if dupes
+            else i18n.t("import.dupes_none", new=new))
 
     def _selected_rows(self) -> list:
         return [row for row, keep in zip(self.preview_rows,
@@ -988,13 +1094,22 @@ class MainWindow(QMainWindow):
         filters.addSpacing(14)
         filters.addWidget(QLabel(i18n.t("tags.chart")))
         self.tag_chart_combo = QComboBox()
-        for key, label in ((charts.CHART_TAG_MONTH, "tags.chart_month"),
+        for key, label in ((charts.CHART_TAG_INSTALLED, "tags.chart_installed"),
                            (charts.CHART_TAG_TYPE, "tags.chart_type"),
-                           (charts.CHART_TAG_DEPT, "tags.chart_dept"),
-                           (charts.CHART_TAG_WEEK, "tags.chart_week")):
+                           (charts.CHART_TAG_DEPT, "tags.chart_dept")):
             self.tag_chart_combo.addItem(i18n.t(label), key)
         self.tag_chart_combo.currentIndexChanged.connect(self._render_tag_chart)
         filters.addWidget(self.tag_chart_combo)
+
+        filters.addWidget(QLabel(i18n.t("grain.label")))
+        self.grain_combo = QComboBox()
+        for grain in analytics.GRAINS:
+            self.grain_combo.addItem(i18n.t("grain." + grain), grain)
+        index = self.grain_combo.findData(
+            settings.get("tag_grain") or analytics.GRAIN_MONTH)
+        self.grain_combo.setCurrentIndex(max(index, 0))
+        self.grain_combo.currentIndexChanged.connect(self._on_grain_changed)
+        filters.addWidget(self.grain_combo)
         filters.addStretch(1)
         self.lbl_tag_rows = QLabel()
         filters.addWidget(self.lbl_tag_rows)
@@ -1114,12 +1229,23 @@ class MainWindow(QMainWindow):
                                          total=len(self.movements)))
         self._render_tag_chart()
 
+    def _on_grain_changed(self, *_args):
+        if self._loading:
+            return
+        settings.set_("tag_grain", self.grain_combo.currentData())
+        self._render_tag_chart()
+
+    def _grain(self) -> str:
+        return self.grain_combo.currentData() or analytics.GRAIN_MONTH
+
     def _render_tag_chart(self, *_args):
         if self._loading:
             return
+        grain = self._grain()
         charts.render_tags(self.tag_canvas,
                            self.tag_chart_combo.currentData(),
-                           self._filtered_movements())
+                           self._filtered_movements(), grain,
+                           _GRAIN_CHART_LIMIT.get(grain, 0))
 
     # ==================================================================
     # Recarga desde la base
@@ -1177,10 +1303,15 @@ class MainWindow(QMainWindow):
         self.preview_rows = mapping.submissions_to_rows(subs)
         self.preview_codes = [s.get(mapping.H_CODE) or "" for s in subs]
         self.preview_checked = [True] * len(self.preview_rows)
+        self.preview_state = [_STATE_NEW] * len(self.preview_rows)
         self._populate_preview()
         self._refresh_status()
         self.statusBar().showMessage(
             i18n.t("msg.loaded", n=len(subs), file=os.path.basename(path)))
+        # El export del formulario es acumulativo: cada descarga trae otra vez
+        # todo lo anterior. Marcar lo repetido aqui es lo que evita que el
+        # maestro reciba dos veces la misma inspeccion.
+        self._mark_duplicates()
 
     def _on_pick_target(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1194,6 +1325,9 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         self.statusBar().showMessage(
             i18n.t("msg.target_set", file=os.path.basename(path)))
+        if self.preview_rows:
+            # Cambiar de maestro cambia que esta duplicado y que no.
+            self._mark_duplicates()
 
     def _on_import_history(self):
         if not self.target_path:
@@ -1217,6 +1351,8 @@ class MainWindow(QMainWindow):
             i18n.t("prog.history", sheet=source_reader.FULL_LIST_SHEET),
             store.add_inspections, records)
         self._reload_inspections()
+        if self.preview_rows:
+            self._mark_duplicates(announce=False)
         QMessageBox.information(
             self, i18n.t("dlg.info"),
             i18n.t("msg.history_loaded", read=len(rows),
@@ -1231,6 +1367,7 @@ class MainWindow(QMainWindow):
             return
         result = store.add_inspections(records)
         self._reload_inspections()
+        self._mark_duplicates(announce=False)
         QMessageBox.information(
             self, i18n.t("dlg.info"),
             i18n.t("msg.stored", added=result["added"],
@@ -1242,6 +1379,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, i18n.t("dlg.info"),
                                     i18n.t("msg.nothing_checked"))
             return
+
+        # El maestro no deduplica: si el usuario vuelve a marcar filas que ya
+        # estan cargadas, se le dice antes de escribir y no despues.
+        dupes = sum(1 for keep, state in zip(self.preview_checked,
+                                             self.preview_state)
+                    if keep and state != _STATE_NEW)
+        if dupes:
+            answer = QMessageBox.question(
+                self, i18n.t("dlg.confirm"),
+                i18n.t("import.confirm_dupes", n=len(rows), dupes=dupes),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+
         confirm = QMessageBox.question(
             self, i18n.t("dlg.confirm"),
             i18n.t("msg.confirm_append", n=len(rows),
@@ -1276,6 +1427,8 @@ class MainWindow(QMainWindow):
             self._reload_inspections()
             message += "\n\n" + i18n.t("msg.stored", added=stored["added"],
                                        skipped=stored["skipped"])
+        # Lo recien escrito ya es 'viejo' para la proxima pasada.
+        self._mark_duplicates(announce=False)
         message += "\n\n" + i18n.t("msg.refresh_hint")
         QMessageBox.information(self, i18n.t("dlg.info"), message)
         self.statusBar().showMessage(
@@ -1412,7 +1565,8 @@ class MainWindow(QMainWindow):
         try:
             _run_with_progress(
                 self, i18n.t("prog.export_title"), i18n.t("prog.export"),
-                report_export.export_tags, path, self._filtered_movements())
+                report_export.export_tags, path, self._filtered_movements(),
+                self._grain())
         except PermissionError:
             QMessageBox.critical(self, i18n.t("dlg.error"),
                                  i18n.t("msg.file_in_use"))

@@ -175,6 +175,49 @@ def test_summary_counts_installed_without_removals(tmp_path):
     assert ws.cell(row=header + 1, column=6).value == 1     # retiros
 
 
+def test_tag_export_groups_by_the_requested_grain(tmp_path):
+    """El resumen cambia de cubeta; el detalle de movimientos no."""
+    for grain in analytics.GRAINS:
+        path = str(tmp_path / ("tags_%s.xlsx" % grain))
+        report_export.export_tags(path, _movements(), grain)
+        wb = openpyxl.load_workbook(path)
+        summary = wb[i18n.t("sheet.tagsummary")]
+        data = wb[i18n.t("sheet.taginstalled")]
+        rows = len(analytics.tag_by_period(_movements(), grain))
+        # Titulo + subtitulo + blanco + encabezado + una fila por cubeta.
+        assert summary.max_row == 4 + rows
+        assert len(summary._charts) == 1
+        assert data.max_row == 6      # el detalle no depende del grano
+
+
+def test_monthly_grain_keeps_the_year_month_pair(tmp_path):
+    path = str(tmp_path / "tags.xlsx")
+    report_export.export_tags(path, _movements(), analytics.GRAIN_MONTH)
+    ws = openpyxl.load_workbook(path)[i18n.t("sheet.tagsummary")]
+    header = next(r for r in range(1, 10)
+                  if ws.cell(row=r, column=1).value == i18n.t("col.year"))
+    assert ws.cell(row=header, column=2).value == i18n.t("col.month")
+
+
+def test_other_grains_use_a_single_period_column(tmp_path):
+    path = str(tmp_path / "tags.xlsx")
+    report_export.export_tags(path, _movements(), analytics.GRAIN_DAY)
+    ws = openpyxl.load_workbook(path)[i18n.t("sheet.tagsummary")]
+    header = next(r for r in range(1, 10)
+                  if ws.cell(row=r, column=1).value == i18n.t("grain.col_day"))
+    assert ws.cell(row=header, column=2).value == "SMU"
+    # El dia va como fecha real, para poder ordenarlo y agruparlo en Excel.
+    assert ws.cell(row=header + 1, column=1).value == \
+        datetime.datetime(2026, 6, 1)
+
+
+def test_unknown_grain_falls_back_to_monthly(tmp_path):
+    path = str(tmp_path / "tags.xlsx")
+    report_export.export_tags(path, _movements(), "quincenal")
+    ws = openpyxl.load_workbook(path)[i18n.t("sheet.tagsummary")]
+    assert ws.cell(row=4, column=1).value == i18n.t("col.year")
+
+
 def test_suggested_name_changes_with_the_language(tmp_path):
     assert report_export.suggested_name("tags").startswith("Tags Instalados")
     i18n.set_language(i18n.EN)
