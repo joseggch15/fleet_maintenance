@@ -205,6 +205,17 @@ _VALUES = {
                          EN: "File has no TYPE column, assumed installation"},
     "FUTURE_DATE":      {ES: "Fecha posterior a hoy, revisar el origen",
                          EN: "Date later than today, check the source"},
+    "FIXED_YEAR":       {ES: "Ano corregido con el periodo del archivo; "
+                             "el original decia",
+                         EN: "Year fixed using the file period; the original "
+                             "said"},
+    "FIXED_SWAP":       {ES: "Dia y mes invertidos, corregidos con el periodo "
+                             "del archivo; el original decia",
+                         EN: "Day and month swapped, fixed using the file "
+                             "period; the original said"},
+    "SUSPECT_DATE":     {ES: "Fecha fuera del periodo del archivo y sin "
+                             "correccion segura",
+                         EN: "Date outside the file period with no safe fix"},
 }
 
 
@@ -414,6 +425,21 @@ _UI = {
                         EN: "Export consolidated Excel..."},
     "tags.btn_clear": {ES: "Vaciar tags almacenados",
                        EN: "Clear stored tag movements"},
+    "tags.repair": {ES: "Corregir fechas con el periodo del archivo",
+                    EN: "Fix dates using the file period"},
+    "tags.repair_tip": {
+        ES: "El nombre de cada archivo declara la semana que cubre. Con esto "
+            "activado, una fila cuya fecha caiga muy lejos de esa semana se "
+            "corrige si —y solo si— cambiando el ano, o invirtiendo dia y "
+            "mes, queda una unica fecha posible dentro del periodo. La "
+            "correccion siempre queda anotada en la columna Observacion junto "
+            "con el valor original; los archivos de origen no se tocan.",
+        EN: "Each file name declares the week it covers. With this on, a row "
+            "whose date falls far outside that week is fixed if —and only "
+            "if— changing the year, or swapping day and month, leaves a "
+            "single possible date inside the period. The fix is always "
+            "recorded in the Notes column along with the original value; the "
+            "source files are never touched."},
     "tags.filter_type": {ES: "Movimiento:", EN: "Movement:"},
     "tags.filter_device": {ES: "Dispositivo:", EN: "Device:"},
     "tags.filter_dept": {ES: "Departamento:", EN: "Department:"},
@@ -601,6 +627,15 @@ _UI = {
             "MAC) es SMU, si no es TAG.",
         EN: "Device type is derived from the tag: with colons (MAC format) it "
             "is SMU, otherwise TAG."},
+    "note.tags_repaired": {
+        ES: "{n} fecha(s) se corrigieron contra el periodo que declara el "
+            "nombre del archivo semanal (ano equivocado, o dia y mes "
+            "invertidos). Cada una lleva el valor original en su columna de "
+            "observacion. Los archivos de origen no se modificaron.",
+        EN: "{n} date(s) were fixed against the period declared by the weekly "
+            "file name (wrong year, or day and month swapped). Each one "
+            "carries its original value in the notes column. The source files "
+            "were not modified."},
     "note.tags_dedupe": {
         ES: "Los movimientos repetidos entre archivos con solape se cargan una "
             "sola vez (misma combinacion de movimiento, fecha, ID y tag).",
@@ -669,6 +704,18 @@ _UI = {
             "{skipped} repetidos omitidos.",
         EN: "{files} file(s) read: {added} new movement(s), {skipped} "
             "duplicates skipped."},
+    "msg.tags_repaired": {
+        ES: "{n} fecha(s) se corrigieron con el periodo que declara el nombre "
+            "del archivo. Quedan marcadas en la columna Observacion.",
+        EN: "{n} date(s) were fixed using the period declared by the file "
+            "name. They are flagged in the Notes column."},
+    "msg.tags_suspect": {
+        ES: "{n} fila(s) tienen una fecha que no se pudo interpretar ni "
+            "corregir con seguridad. Entran igual, marcadas, para que se "
+            "arreglen en el archivo de origen.",
+        EN: "{n} row(s) have a date that could not be read or safely fixed. "
+            "They are loaded anyway, flagged, so they can be fixed in the "
+            "source file."},
     "msg.tags_none": {
         ES: "No se encontraron archivos de tags legibles en la seleccion.",
         EN: "No readable tag files were found in the selection."},

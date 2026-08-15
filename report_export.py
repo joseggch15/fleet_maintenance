@@ -571,6 +571,12 @@ def export_tags(path: str, movements: list,
     undated = sum(1 for m in movements if not m.get("date"))
     notes = [i18n.t("note.tags"), i18n.t("note.tags_device"),
              i18n.t("note.tags_dedupe")]
+    repaired = (tag_reader.count_notes(movements, tag_reader.NOTE_FIXED_YEAR) +
+                tag_reader.count_notes(movements, tag_reader.NOTE_FIXED_SWAP))
+    if repaired:
+        # Un dato corregido tiene que decirlo en el propio archivo: quien lo
+        # reciba no vio la pantalla donde el software lo anuncio.
+        notes.append(i18n.t("note.tags_repaired", n=repaired))
     if undated:
         notes.append(i18n.t("note.undated", n=undated))
     _sheet_notes(wb, notes)

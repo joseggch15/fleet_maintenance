@@ -1049,6 +1049,13 @@ class MainWindow(QMainWindow):
         btn_files.clicked.connect(self._on_load_tag_files)
         buttons.addWidget(btn_folder)
         buttons.addWidget(btn_files)
+        self.chk_repair = QCheckBox(i18n.t("tags.repair"))
+        self.chk_repair.setChecked(bool(settings.get("repair_dates")))
+        self.chk_repair.setToolTip(i18n.t("tags.repair_tip"))
+        self.chk_repair.toggled.connect(
+            lambda v: settings.set_("repair_dates", bool(v)))
+        buttons.addSpacing(12)
+        buttons.addWidget(self.chk_repair)
         buttons.addStretch(1)
         btn_clear = QPushButton(i18n.t("tags.btn_clear"))
         btn_clear.setObjectName("danger")
@@ -1525,7 +1532,8 @@ class MainWindow(QMainWindow):
             return
         result = _run_with_progress(
             self, i18n.t("prog.tags_title"), i18n.t("prog.tags"),
-            tag_reader.read_paths, paths)
+            tag_reader.read_paths, paths,
+            repair=self.chk_repair.isChecked())
         if not result["records"]:
             QMessageBox.warning(self, i18n.t("dlg.warning"),
                                 i18n.t("msg.tags_none"))
@@ -1535,6 +1543,11 @@ class MainWindow(QMainWindow):
 
         message = i18n.t("msg.tags_stored", files=len(result["files"]),
                          added=stored["added"], skipped=stored["skipped"])
+        if result["repaired"]:
+            message += "\n\n" + i18n.t("msg.tags_repaired",
+                                       n=result["repaired"])
+        if result["suspect"]:
+            message += "\n\n" + i18n.t("msg.tags_suspect", n=result["suspect"])
         if result["errors"]:
             message += "\n\n" + "\n".join(
                 "%s: %s" % (name, err) for name, err in result["errors"][:8])

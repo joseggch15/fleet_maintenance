@@ -52,6 +52,9 @@ DEFAULTS = {
     "dashboard_months": 24,
     # Granularidad de las graficas y del resumen de tags: day/week/month/year.
     "tag_grain": "month",
+    # Corregir las fechas de los semanales contra el periodo del nombre del
+    # archivo. Ver `tag_reader.repair_date`.
+    "repair_dates": True,
     "backup_target": True,
     "store_on_append": True,
     "last_source_file": "",

@@ -134,11 +134,60 @@ tocar el origen:
   inferido*, para distinguir un dato leído de uno asumido;
 - el **tipo de dispositivo** sale del tag: con dos puntos (formato MAC) es un
   SMU, si no es un TAG;
-- las fechas que no se pueden interpretar (`19/19/2025`, `31/06/2026`) **no se
-  corrigen ni se descartan**: la fila entra sin fecha y con una observación.
-  Lo mismo con las fechas posteriores a hoy (hay filas de diciembre 2025
-  fechadas en 2027);
 - las semanas que se solapan entre archivos no duplican movimientos.
+
+### Corrección de fechas mal escritas
+
+El nombre de cada archivo declara la semana que cubre, y eso es lo único que
+permite afirmar que una fecha está mal: sin esa referencia, `05/12/2027` es una
+fecha perfectamente válida y no hay con qué discutirla.
+
+Midiendo las 457 filas con fecha de la carpeta del cliente contra la fecha de
+cierre que declara cada nombre:
+
+| Distancia a la semana del archivo | Filas |
+|---|---|
+| entre 10 días antes y 3 después | 95,6% |
+| hasta un mes antes (cargas tardías legítimas) | 1,8% |
+| a más de un año | 2,6% — **las 12 filas mal escritas** |
+
+No hay nada entre "un mes antes" y "un año de distancia". Con esa separación,
+la casilla **Corregir fechas con el periodo del archivo** (activada por
+defecto) aplica una corrección sólo cuando el resultado es **único**:
+
+- **Año equivocado** — `05/12/2027` en el archivo de la semana del `10/12/2025`.
+  El día y el mes ya son correctos; cambiando sólo el año la fila cae dentro de
+  la semana. Aparece en las dos direcciones: también hay filas de 2025 en
+  archivos de 2026.
+- **Día y mes invertidos** — `05/12` escrito como `12/05`. No se ha visto en
+  estos archivos, pero es el error clásico entre el formato europeo y el
+  americano y el período lo delata igual.
+
+Se considera coherente todo lo que cae entre 45 días antes y 3 después, y sólo
+se intenta reparar lo que queda fuera; para **aceptar** una corrección la
+ventana es más estrecha (31 días antes). Para cambiar un dato hay que estar más
+seguro que para dejarlo.
+
+**Lo que no se corrige.** Las fechas imposibles (`31/06/2026` —junio tiene 30
+días—, `19/19/2025` —mes 19—) entran sin fecha y marcadas. El período del
+archivo puede probar que un *año* está mal, pero no puede decir qué mes quiso
+escribir alguien que tecleó `19`; adivinarlo sería inventar el dato. Lo mismo
+con cualquier fecha fuera de la ventana que no tenga una corrección única: se
+carga tal cual y se marca como sospechosa.
+
+**Toda corrección queda anotada** en la columna *Observación* junto con el valor
+original, en la tabla y en el Excel exportado, y **los archivos de origen no se
+tocan nunca**. Al terminar la carga el software informa cuántas fechas corrigió
+y cuántas quedaron sin resolver.
+
+Sobre los archivos reales corrige exactamente 12 filas —las 10 de 2027 y las 2
+de 2025 en archivos de 2026—, todas cambiando sólo el año y sin tocar ningún
+otro campo ni ninguna otra fila.
+
+> Al reprocesar una carpeta ya cargada con la corrección recién activada, las
+> filas corregidas entran como **nuevas** (la fecha forma parte de la clave de
+> deduplicación) y las versiones viejas siguen en la base. Use **Vaciar tags
+> almacenados** y vuelva a cargar la carpeta.
 
 Los conteos de instalación excluyen los retiros, igual que el
 `=SUMPRODUCT(... <>"REMOVAL")` del consolidado del cliente.
@@ -153,10 +202,9 @@ porque es el detalle y ahí cada fila es un movimiento.
   semana van como **fecha real** para poder ordenarlos y armar una dinámica en
   Excel.
 - En pantalla la gráfica muestra las últimas cubetas **con datos** (45 días, 30
-  semanas, 36 meses) y no las últimas a secas. La diferencia importa con estos
-  archivos: hay movimientos fechados en 2027 por un error de tipeo, y contando
-  hacia atrás desde ahí las 30 últimas semanas caerían todas dentro del hueco.
-  Los huecos intermedios se conservan — son justamente lo que delata el error.
+  semanas, 36 meses) y no las últimas a secas, para que un dato suelto muy
+  lejano no deje la vista vacía. Los huecos intermedios se conservan: un hueco
+  es información y, cuando es anómalo, es lo que delata un error en el origen.
 
 ### 5. Exportar
 
