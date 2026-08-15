@@ -104,6 +104,70 @@ def source_workbook(tmp_path):
     return path
 
 
+@pytest.fixture
+def weekly_tag_files(tmp_path):
+    """Carpeta que imita 'Tag Installed Per Week' con sus tres formatos.
+
+    - un archivo viejo sin columna TYPE y con los alias 'CC'/'Dept',
+    - un archivo nuevo con TYPE y Product,
+    - una subcarpeta con otro archivo nuevo que SOLAPA un dia con el anterior
+      (misma fila repetida), para verificar la deduplicacion,
+    - una hoja 'Summary' que no es data y debe ignorarse.
+    """
+    folder = tmp_path / "Tag Installed Per Week"
+    folder.mkdir()
+    sub = folder / "Inventory Tag Installed 03062026"
+    sub.mkdir()
+
+    old = openpyxl.Workbook()
+    ws = old.active
+    ws.title = "Sheet1"
+    ws.append(["DATE", "ID", "Tag", "CC", "Dept"])
+    ws.append([datetime.datetime(2025, 1, 10), "C-155", "56B2B853", 14386,
+               "mine_ops"])
+    ws.append(["19/19/2025", "CPR0988", "56B5609E", 14413, "PROCESS OPS"])
+    old.save(str(folder / "Inventory Tag Installed 12012025.xlsx"))
+
+    new = openpyxl.Workbook()
+    ws = new.active
+    ws.title = "Tag Installed"
+    ws.append(["TYPE", "DATE", "ID", "Tag", "Cost Center", "Department",
+               "Product"])
+    ws.append(["NEW INSTALLATION", datetime.datetime(2026, 6, 1), "LVE2136",
+               "CA:CC:A3:FA:4C:2B", 14387, "MINE_OPS", "Diesel"])
+    ws.append(["REMOVAL", datetime.datetime(2026, 6, 2), "R-1480",
+               "56B2D9A6", 14387, "SUSTAINING CAPEX", "Diesel"])
+    ws.append(["Tag updated ", datetime.datetime(2026, 6, 3), "C-201",
+               "56B36ACF", 14386, "MINE_OPS", None])
+    summary = new.create_sheet("Summary")
+    summary.append(["KPI", "Value"])
+    summary.append(["Total", 3])
+    new.save(str(folder / "Inventory Tag Installed 01062026.xlsx"))
+
+    overlap = openpyxl.Workbook()
+    ws = overlap.active
+    ws.title = "Tag Installed"
+    ws.append(["TYPE", "DATE", "ID", "Tag", "Cost Center", "Department"])
+    # Repetida del archivo anterior: no debe entrar dos veces.
+    ws.append(["REMOVAL", datetime.datetime(2026, 6, 2), "R-1480",
+               "56B2D9A6", 14387, "SUSTAINING CAPEX"])
+    ws.append(["REPLACEMENT", datetime.datetime(2026, 6, 5), "LTR0371",
+               "56B56D63", 15086, "EMULSION PLANT"])
+    overlap.save(str(sub / "Inventory Tag Installed 03062026-10062026.xlsx"))
+    return str(folder)
+
+
+@pytest.fixture
+def temp_store(tmp_path):
+    """Base local vacia y aislada de la del usuario."""
+    import store
+    previous = store.path()
+    store.set_path(os.path.join(str(tmp_path), "test.sqlite3"))
+    store.init()
+    yield store
+    store.set_path(previous)
+
+
 def excel_sheet_name():
     import excel_writer
     return excel_writer.SHEET_NAME

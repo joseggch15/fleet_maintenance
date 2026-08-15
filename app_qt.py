@@ -2,71 +2,75 @@
 """
 Interfaz grafica (PySide6) del cargador de mantenimiento de flota.
 
-Flujo:
-  1. 'Cargar Excel de submissions...'  -> lee el export del formulario
-     (merian_ops - Form - Fleet maintenance - Submissions).
-  2. 'Seleccionar Excel destino...'    -> el maestro
-     'Fleet Tag Inventory and Maintenance.xlsx'.
-  3. Revisar / corregir las filas en la tabla de previsualizacion. Cada fila
-     trae una casilla 'Incluir' para decidir cuales se cargan.
-  4. 'CARGAR AL EXCEL DESTINO'         -> agrega las filas a la hoja
-     'Full List 2024-2025' conservando estilos, formulas y la tabla Table3.
-     Se hace un respaldo automatico del destino antes de escribir.
+Cuatro pestanas:
+
+  Importar submissions  el flujo original — leer el export del formulario,
+                        revisar fila por fila y volcarlo a la hoja
+                        'Full List 2024-2025' del Excel maestro. Ademas puede
+                        guardar esas filas en la base local y traer de vuelta
+                        el historico que el maestro ya tiene.
+  Full List             las inspecciones almacenadas, con filtros y exportacion
+                        a un Excel con el mismo formato del maestro.
+  Tablero               las graficas del maestro (revisados por mes y % de
+                        inspeccion) calculadas sobre la base local.
+  Tags por semana       consolidacion de la carpeta 'Tag Installed Per Week' y
+                        su resumen de instalacion.
+
+Idioma y tema se cambian desde la barra superior. Cambiarlos RECONSTRUYE la
+ventana entera (`_rebuild`) en vez de recorrer widget por widget: es la unica
+forma de que no queden textos viejos colgados en un dialogo o en una leyenda de
+grafica. Los datos ya leidos se conservan en memoria, asi que cambiar de idioma
+no cuesta otra lectura de 4.000 filas.
 
 Ejecutar:  python run.py
 """
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 import traceback
-import datetime
 
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QMainWindow, QMessageBox, QProgressDialog,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QProgressDialog, QPushButton, QSpinBox, QSplitter, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-import mapping
-import source_reader
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+
+import analytics
+import charts
 import excel_writer
-
-PRIMARY = "#1F4E78"
-ACCENT = "#2E7D32"
-DANGER = "#C62828"
-BG = "#F4F6F9"
-
-STYLESHEET = f"""
-QMainWindow, QWidget {{ background: {BG}; color: #1A1A1A; }}
-QGroupBox {{
-    font-weight: bold; color: {PRIMARY};
-    border: 1px solid #C9D3DF; border-radius: 8px;
-    margin-top: 14px; padding: 10px;
-}}
-QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; }}
-QLabel {{ color: #1A1A1A; }}
-QPushButton {{
-    background: {PRIMARY}; color: white; border: none;
-    border-radius: 6px; padding: 7px 14px; font-weight: bold;
-}}
-QPushButton:hover {{ background: #2A5F92; }}
-QPushButton:disabled {{ background: #9AA8B8; color: white; }}
-QPushButton#accent {{ background: {ACCENT}; }}
-QPushButton#accent:hover {{ background: #388E3C; }}
-QTableWidget {{ background: white; gridline-color: #DCE3EB; color: #1A1A1A; }}
-QTableWidget QTableCornerButton::section {{ background: {PRIMARY}; }}
-QHeaderView::section {{
-    background: {PRIMARY}; color: white; padding: 6px; border: none;
-    font-weight: bold;
-}}
-QLabel#title {{ font-size: 16px; font-weight: bold; color: {PRIMARY}; }}
-"""
+import i18n
+import mapping
+import report_export
+import settings
+import source_reader
+import store
+import tag_reader
+import theme
 
 # Columnas de datos que se muestran/editan en la previsualizacion (B, C, E..S).
 PREVIEW_COLUMNS = mapping.DATA_COLUMNS
+
+_PREVIEW_LABELS = {
+    "B": "col.date_target", "C": "col.vehicle", "E": "col.fms",
+    "F": "col.fitted", "G": "col.hours", "H": "col.fms_hours",
+    "I": "col.status", "J": "col.inlets", "K": "col.addl_locked",
+    "L": "col.drain_locked", "M": "col.leaking", "N": "col.smu_tags",
+    "O": "col.equipment", "P": "col.remarks", "Q": "col.inspectors",
+    "R": "col.owner", "S": "col.remedial",
+}
+
+# La tabla de 'Full List' se llena con widgets, no con un modelo: pasadas unas
+# miles de filas eso se nota al filtrar. Se muestran las mas recientes y se
+# avisa; los calculos y la exportacion siguen usando todas.
+_TABLE_LIMIT = 2000
 
 
 class _BackgroundWorker(QThread):
@@ -96,7 +100,7 @@ def _run_with_progress(parent, title, message, func, *args, **kwargs):
     dlg.setAutoClose(False)
     dlg.setAutoReset(False)
     dlg.setCancelButton(None)
-    dlg.setMinimumWidth(420)
+    dlg.setMinimumWidth(440)
 
     from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
     import inspect
@@ -129,58 +133,298 @@ def _run_with_progress(parent, title, message, func, *args, **kwargs):
 def _fmt_cell(value) -> str:
     if value is None:
         return ""
-    if isinstance(value, datetime.datetime):
-        return value.strftime("%d/%m/%Y")
-    if isinstance(value, datetime.date):
-        return value.strftime("%d/%m/%Y")
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.strftime(i18n.date_format())
     return str(value)
+
+
+def _card(parent_layout, key_value, key_label, key_hint):
+    """Tarjeta de indicador: valor grande, etiqueta y aclaracion."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(12, 8, 12, 8)
+    lay.setSpacing(1)
+    value = QLabel(key_value)
+    value.setObjectName("cardValue")
+    label = QLabel(key_label)
+    label.setObjectName("cardLabel")
+    hint = QLabel(key_hint)
+    hint.setObjectName("cardHint")
+    hint.setWordWrap(True)
+    lay.addWidget(value)
+    lay.addWidget(label)
+    lay.addWidget(hint)
+    parent_layout.addWidget(frame)
+    frame.value_label = value
+    return frame
+
+
+class FleetSizeDialog(QDialog):
+    """Editor de la flota total mes a mes.
+
+    Es el denominador de '% Inspection per month' y no se puede deducir de las
+    inspecciones: la flota incluye equipos que ese mes nadie toco. En el Excel
+    del cliente esta escrito a mano dentro de cada formula; aqui al menos queda
+    en un solo lugar y se guarda con las preferencias.
+    """
+
+    def __init__(self, parent, months: list, sizes: dict):
+        super().__init__(parent)
+        self.setWindowTitle(i18n.t("fleet.title"))
+        self.setStyleSheet(theme.stylesheet())
+        self.resize(420, 560)
+
+        lay = QVBoxLayout(self)
+        hint = QLabel(i18n.t("fleet.hint"))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.months = list(months)
+        self.table = QTableWidget(len(self.months), 2)
+        self.table.setHorizontalHeaderLabels(
+            [i18n.t("dash.table_month"), i18n.t("dash.table_fleet")])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch)
+        for row, month in enumerate(self.months):
+            item = QTableWidgetItem(i18n.month_label(month))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+            spin = QSpinBox()
+            spin.setRange(0, 100000)
+            spin.setValue(int(sizes.get(month, 0) or 0))
+            self.table.setCellWidget(row, 1, spin)
+        lay.addWidget(self.table, 1)
+
+        fill = QPushButton(i18n.t("fleet.btn_fill"))
+        fill.setObjectName("ghost")
+        fill.clicked.connect(self._fill_down)
+        lay.addWidget(fill)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save |
+                                   QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText(i18n.t("fleet.btn_ok"))
+        buttons.button(QDialogButtonBox.Cancel).setText(
+            i18n.t("fleet.btn_cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _fill_down(self):
+        """Copia hacia abajo el ultimo valor distinto de cero.
+
+        La flota cambia de a pocos equipos por mes; cargar 24 casillas a mano
+        cuando 20 son el mismo numero es trabajo inutil.
+        """
+        last = 0
+        for row in range(self.table.rowCount()):
+            spin = self.table.cellWidget(row, 1)
+            if spin.value():
+                last = spin.value()
+            elif last:
+                spin.setValue(last)
+
+    def sizes(self) -> dict:
+        out = {}
+        for row, month in enumerate(self.months):
+            value = self.table.cellWidget(row, 1).value()
+            if value:
+                out[month] = value
+        return out
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(
-            "Cargador de Mantenimiento de Flota  -  Newmont Merian")
-        self.resize(1280, 760)
-        self.setStyleSheet(STYLESHEET)
+        store.init()
 
-        self.source_path = ""
-        self.target_path = ""
-        self.submissions = []   # list[dict] crudas del formulario
+        self.source_path = settings.get("last_source_file") or ""
+        self.target_path = settings.get("last_target_file") or ""
+        if not os.path.exists(self.target_path):
+            self.target_path = ""
 
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.addWidget(self._build_controls())
-        layout.addWidget(self._build_preview(), stretch=1)
-        layout.addWidget(self._build_footer())
+        # Estado del formulario en curso (no se guarda en la base hasta que el
+        # usuario lo pide).
+        self.submissions = []
+        self.preview_rows = []      # list[dict] {columna: valor}
+        self.preview_codes = []     # codigo de submission por fila
+        self.preview_checked = []   # list[bool]
 
-        self.statusBar().showMessage(
-            "Cargue el Excel de submissions y seleccione el Excel destino.")
+        # Cache de la base: se recarga al importar o al borrar, no en cada
+        # cambio de filtro ni al cambiar de idioma.
+        self.inspections = []
+        self.movements = []
+        self.pivot = analytics.Pivot()
+        self.kpis = []
+
+        # Mientras se construye la ventana, los combos disparan sus senales
+        # con datos a medio armar. Este candado hace que los refrescos se
+        # ignoren hasta que la ventana este completa.
+        self._loading = True
+        self._build()
+        self.inspections = store.inspections()
+        self.movements = store.movements()
+        self._refresh_views()
+
+    # ------------------------------------------------------------------
+    # Ciclo de vida
+    # ------------------------------------------------------------------
+    def closeEvent(self, event):
+        settings.set_("window", {"w": self.width(), "h": self.height(),
+                                 "maximized": self.isMaximized()})
+        super().closeEvent(event)
+
+    def _build(self):
+        self._loading = True
+        try:
+            self.setWindowTitle(i18n.t("app.title"))
+            self.setStyleSheet(theme.stylesheet())
+
+            central = QWidget()
+            outer = QVBoxLayout(central)
+            outer.setContentsMargins(10, 8, 10, 8)
+            outer.setSpacing(8)
+            outer.addWidget(self._build_topbar())
+
+            self.tabs = QTabWidget()
+            self.tabs.addTab(self._tab_import(), i18n.t("tab.import"))
+            self.tabs.addTab(self._tab_full_list(), i18n.t("tab.fulllist"))
+            self.tabs.addTab(self._tab_dashboard(), i18n.t("tab.dashboard"))
+            self.tabs.addTab(self._tab_tags(), i18n.t("tab.tags"))
+            outer.addWidget(self.tabs, 1)
+
+            self.setCentralWidget(central)
+            self.statusBar().showMessage(i18n.t("app.ready"))
+        finally:
+            self._loading = False
+
+    def _rebuild(self):
+        """Reconstruye la ventana tras cambiar idioma o tema.
+
+        Los datos leidos se conservan en memoria; lo unico que se rehace son
+        los widgets. Se guarda antes que estaba eligiendo el usuario (pestana,
+        grafica, periodo) para devolverlo a donde estaba: cambiar el idioma no
+        deberia hacerle perder el sitio.
+        """
+        combo_names = ("chart_combo", "tag_chart_combo", "period_combo",
+                       "year_combo", "owner_combo", "tag_year_combo",
+                       "tag_type_combo", "tag_device_combo", "tag_dept_combo")
+        state = {
+            "tab": self.tabs.currentIndex(),
+            "search": self.search_edit.text(),
+            "combos": {name: getattr(self, name).currentData()
+                       for name in combo_names},
+        }
+        self._build()
+        self._populate_preview()
+        self._populate_filters()
+        self._populate_period_combo()
+        self._populate_tag_filters()
+
+        self.tabs.setCurrentIndex(state["tab"])
+        self.search_edit.blockSignals(True)
+        self.search_edit.setText(state["search"])
+        self.search_edit.blockSignals(False)
+        for name in combo_names:
+            combo = getattr(self, name)
+            index = combo.findData(state["combos"][name])
+            if index >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+
+        self._refresh_full_list()
+        self._refresh_dashboard()
+        self._refresh_tag_view()
         self._refresh_status()
 
     # ------------------------------------------------------------------
-    # Construccion de la interfaz
+    # Barra superior
     # ------------------------------------------------------------------
+    def _build_topbar(self) -> QWidget:
+        bar = QWidget()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(2, 0, 2, 0)
+
+        title = QLabel(i18n.t("app.title"))
+        title.setObjectName("title")
+        lay.addWidget(title)
+        lay.addSpacing(16)
+
+        self.lbl_stored = QLabel()
+        self.lbl_stored.setObjectName("subtitle")
+        lay.addWidget(self.lbl_stored)
+        lay.addStretch(1)
+
+        lay.addWidget(QLabel(i18n.t("top.language")))
+        self.lang_combo = QComboBox()
+        for lang in i18n.LANGUAGES:
+            self.lang_combo.addItem(i18n.LANGUAGE_NAMES[lang], lang)
+        self.lang_combo.setCurrentIndex(
+            self.lang_combo.findData(i18n.current()))
+        self.lang_combo.currentIndexChanged.connect(self._on_language)
+        lay.addWidget(self.lang_combo)
+
+        lay.addSpacing(10)
+        lay.addWidget(QLabel(i18n.t("top.theme")))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem(i18n.t("top.theme_light"), theme.LIGHT)
+        self.theme_combo.addItem(i18n.t("top.theme_dark"), theme.DARK)
+        self.theme_combo.setCurrentIndex(
+            self.theme_combo.findData(theme.current()))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme)
+        lay.addWidget(self.theme_combo)
+        return bar
+
+    def _on_language(self, index):
+        settings.set_language(self.lang_combo.itemData(index))
+        self._rebuild()
+
+    def _on_theme(self, index):
+        settings.set_theme(self.theme_combo.itemData(index))
+        self._rebuild()
+
+    # ==================================================================
+    # Pestana 1: importar submissions
+    # ==================================================================
+    def _tab_import(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.addWidget(self._build_controls())
+        lay.addWidget(self._build_preview(), 1)
+        lay.addWidget(self._build_footer())
+        return page
+
     def _build_controls(self) -> QWidget:
-        box = QGroupBox("Archivos")
+        box = QGroupBox(i18n.t("import.files"))
         outer = QVBoxLayout(box)
 
         row = QHBoxLayout()
-        btn_src = QPushButton("Cargar Excel de submissions...")
+        btn_src = QPushButton(i18n.t("import.btn_source"))
         btn_src.clicked.connect(self._on_load_source)
-        btn_tgt = QPushButton("Seleccionar Excel destino...")
+        btn_tgt = QPushButton(i18n.t("import.btn_target"))
         btn_tgt.clicked.connect(self._on_pick_target)
+        self.btn_history = QPushButton(i18n.t("import.btn_history"))
+        self.btn_history.setObjectName("ghost")
+        self.btn_history.clicked.connect(self._on_import_history)
         row.addWidget(btn_src)
         row.addWidget(btn_tgt)
+        row.addWidget(self.btn_history)
         row.addStretch(1)
         outer.addLayout(row)
 
+        hint = QLabel(i18n.t("import.history_hint"))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
-        lbl = QLabel("Estado:")
-        lbl.setStyleSheet("QLabel { font-weight: bold; color: #1F4E78; }")
-        status_row.addWidget(lbl)
+        label = QLabel(i18n.t("import.state"))
+        label.setObjectName("sectionTitle")
+        status_row.addWidget(label)
         self.chip_source = QLabel()
         self.chip_target = QLabel()
         for chip in (self.chip_source, self.chip_target):
@@ -192,258 +436,1019 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_preview(self) -> QWidget:
-        box = QGroupBox("Previsualizacion  (filas que se agregaran a "
-                        "'Full List 2024-2025')")
+        box = QGroupBox(i18n.t("import.preview"))
         lay = QVBoxLayout(box)
-        lay.addWidget(QLabel(
-            "Revise y corrija los valores antes de cargar. Las columnas "
-            "'Date' (A) y 'Verified' (D) del destino son formulas y se "
-            "calculan solas; aqui no se muestran."))
+        hint = QLabel(i18n.t("import.preview_hint"))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
 
-        headers = ["Incluir"] + [
-            "%s · %s" % (c, mapping.TARGET_HEADERS[c]) for c in PREVIEW_COLUMNS]
+        headers = [i18n.t("import.col_include")] + [
+            "%s · %s" % (col, i18n.t(_PREVIEW_LABELS[col]))
+            for col in PREVIEW_COLUMNS]
         self.table = QTableWidget(0, len(headers))
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.verticalHeader().setVisible(True)
+        self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemChanged.connect(self._on_preview_edited)
         lay.addWidget(self.table)
 
         sel = QHBoxLayout()
-        btn_all = QPushButton("Marcar todas")
+        btn_all = QPushButton(i18n.t("import.check_all"))
+        btn_all.setObjectName("ghost")
         btn_all.clicked.connect(lambda: self._set_all_checks(True))
-        btn_none = QPushButton("Desmarcar todas")
+        btn_none = QPushButton(i18n.t("import.uncheck_all"))
+        btn_none.setObjectName("ghost")
         btn_none.clicked.connect(lambda: self._set_all_checks(False))
         sel.addWidget(btn_all)
         sel.addWidget(btn_none)
         sel.addStretch(1)
-        self.lbl_count = QLabel("0 submissions cargadas.")
+        self.lbl_count = QLabel(i18n.t("import.count", n=0))
         sel.addWidget(self.lbl_count)
         lay.addLayout(sel)
         return box
 
     def _build_footer(self) -> QWidget:
-        w = QWidget()
-        lay = QHBoxLayout(w)
+        widget = QWidget()
+        lay = QHBoxLayout(widget)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.chk_backup = QCheckBox("Crear respaldo del destino antes de "
-                                    "escribir")
-        self.chk_backup.setChecked(True)
+        self.chk_backup = QCheckBox(i18n.t("import.backup"))
+        self.chk_backup.setChecked(bool(settings.get("backup_target")))
+        self.chk_backup.toggled.connect(
+            lambda v: settings.set_("backup_target", bool(v)))
+        self.chk_store = QCheckBox(i18n.t("import.also_store"))
+        self.chk_store.setChecked(bool(settings.get("store_on_append")))
+        self.chk_store.toggled.connect(
+            lambda v: settings.set_("store_on_append", bool(v)))
         lay.addWidget(self.chk_backup)
+        lay.addWidget(self.chk_store)
         lay.addStretch(1)
-        self.btn_load = QPushButton("CARGAR AL EXCEL DESTINO")
+
+        self.btn_store = QPushButton(i18n.t("import.btn_store"))
+        self.btn_store.setMinimumWidth(220)
+        self.btn_store.clicked.connect(self._on_store_only)
+        lay.addWidget(self.btn_store)
+
+        self.btn_load = QPushButton(i18n.t("import.btn_append"))
         self.btn_load.setObjectName("accent")
-        self.btn_load.setMinimumWidth(260)
-        f = QFont()
-        f.setBold(True)
-        self.btn_load.setFont(f)
+        self.btn_load.setMinimumWidth(250)
+        font = QFont()
+        font.setBold(True)
+        self.btn_load.setFont(font)
         self.btn_load.clicked.connect(self._on_append)
         lay.addWidget(self.btn_load)
-        return w
+        return widget
 
-    # ------------------------------------------------------------------
-    # Estado / chips
-    # ------------------------------------------------------------------
+    # -- estado / chips -------------------------------------------------
     def _set_chip(self, chip, loaded, title, detail=""):
+        chip.setObjectName("chipOk" if loaded else "chipWarn")
+        chip.style().unpolish(chip)
+        chip.style().polish(chip)
         if loaded:
-            chip.setStyleSheet(
-                "QLabel { background: #E6F4EA; color: #1B5E20; "
-                "border: 1px solid #2E7D32; border-radius: 12px; "
-                "padding: 3px 12px; }")
             html = "<b>&#10003; %s</b>" % title
             if detail:
-                html += " <span style='color:#33691E;'>(%s)</span>" % detail
+                html += " <span>(%s)</span>" % detail
             chip.setText(html)
         else:
-            chip.setStyleSheet(
-                "QLabel { background: #FFF4E5; color: #8B4500; "
-                "border: 1px solid #FB8C00; border-radius: 12px; "
-                "padding: 3px 12px; }")
-            chip.setText("<b>&#9888; %s</b> sin seleccionar" % title)
+            chip.setText("<b>&#9888; %s</b> %s" % (
+                title, i18n.t("import.chip_missing")))
 
     def _refresh_status(self):
         if self.source_path and self.submissions:
-            self._set_chip(self.chip_source, True, "Submissions",
-                           "%s &mdash; %d filas" % (
-                               os.path.basename(self.source_path),
-                               len(self.submissions)))
+            self._set_chip(
+                self.chip_source, True, i18n.t("import.chip_source"),
+                "%s &mdash; %s" % (os.path.basename(self.source_path),
+                                   i18n.t("import.chip_rows",
+                                          n=len(self.submissions))))
         else:
-            self._set_chip(self.chip_source, False, "Submissions")
+            self._set_chip(self.chip_source, False,
+                           i18n.t("import.chip_source"))
         if self.target_path:
-            self._set_chip(self.chip_target, True, "Excel destino",
+            self._set_chip(self.chip_target, True,
+                           i18n.t("import.chip_target"),
                            os.path.basename(self.target_path))
         else:
-            self._set_chip(self.chip_target, False, "Excel destino")
-        self.btn_load.setEnabled(bool(self.submissions and self.target_path))
+            self._set_chip(self.chip_target, False,
+                           i18n.t("import.chip_target"))
 
-    # ------------------------------------------------------------------
-    # Tabla de previsualizacion
-    # ------------------------------------------------------------------
-    def _populate_table(self):
-        rows = mapping.submissions_to_rows(self.submissions)
-        self.table.setRowCount(0)
-        for rowdata in rows:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            chk = QCheckBox()
-            chk.setChecked(True)
-            holder = QWidget()
-            hl = QHBoxLayout(holder)
-            hl.setContentsMargins(0, 0, 0, 0)
-            hl.setAlignment(Qt.AlignCenter)
-            hl.addWidget(chk)
-            self.table.setCellWidget(r, 0, holder)
-            for ci, col in enumerate(PREVIEW_COLUMNS, start=1):
-                self.table.setItem(
-                    r, ci, QTableWidgetItem(_fmt_cell(rowdata.get(col))))
-        self.table.resizeColumnsToContents()
-        self.lbl_count.setText("%d submissions cargadas." % len(rows))
+        has_rows = bool(self.preview_rows)
+        self.btn_load.setEnabled(has_rows and bool(self.target_path))
+        self.btn_store.setEnabled(has_rows)
+        self.btn_history.setEnabled(bool(self.target_path))
+        self.lbl_stored.setText(i18n.t(
+            "top.stored",
+            inspections=i18n.fmt_number(len(self.inspections)),
+            tags=i18n.fmt_number(len(self.movements))))
+
+    # -- tabla de previsualizacion --------------------------------------
+    def _populate_preview(self):
+        self._loading = True
+        try:
+            self.table.setRowCount(0)
+            for index, rowdata in enumerate(self.preview_rows):
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                check = QCheckBox()
+                check.setChecked(self.preview_checked[index])
+                check.toggled.connect(
+                    lambda value, i=index: self._set_check(i, value))
+                holder = QWidget()
+                box = QHBoxLayout(holder)
+                box.setContentsMargins(0, 0, 0, 0)
+                box.setAlignment(Qt.AlignCenter)
+                box.addWidget(check)
+                self.table.setCellWidget(row, 0, holder)
+                for col_index, col in enumerate(PREVIEW_COLUMNS, start=1):
+                    self.table.setItem(
+                        row, col_index,
+                        QTableWidgetItem(_fmt_cell(rowdata.get(col))))
+            self.table.resizeColumnsToContents()
+        finally:
+            self._loading = False
+        self.lbl_count.setText(i18n.t("import.count",
+                                      n=len(self.preview_rows)))
+
+    def _set_check(self, index, value):
+        if 0 <= index < len(self.preview_checked):
+            self.preview_checked[index] = bool(value)
 
     def _set_all_checks(self, checked: bool):
-        for r in range(self.table.rowCount()):
-            chk = self._row_checkbox(r)
-            if chk:
-                chk.setChecked(checked)
+        self.preview_checked = [checked] * len(self.preview_checked)
+        self._populate_preview()
 
-    def _row_checkbox(self, r):
-        holder = self.table.cellWidget(r, 0)
-        return holder.findChild(QCheckBox) if holder else None
+    def _on_preview_edited(self, item):
+        """Lleva la edicion de la celda al modelo, conservando el tipo.
 
-    def _collect_selected_rows(self) -> list:
-        """Lee la tabla y devuelve las filas marcadas como dicts {col: valor}.
-
-        Re-mapea cada submission (para conservar tipos como fecha) y luego
-        aplica las ediciones de texto que el usuario haya hecho en la tabla.
+        Si el texto no cambio se deja el valor original: reconstruirlo desde el
+        texto convertiria una fecha en cadena y el Excel la escribiria como
+        texto, rompiendo la formula 'Date' del maestro.
         """
-        base_rows = mapping.submissions_to_rows(self.submissions)
-        selected = []
-        for r in range(self.table.rowCount()):
-            chk = self._row_checkbox(r)
-            if not chk or not chk.isChecked():
-                continue
-            rowdata = dict(base_rows[r])
-            for ci, col in enumerate(PREVIEW_COLUMNS, start=1):
-                item = self.table.item(r, ci)
-                text = item.text().strip() if item else ""
-                rowdata[col] = self._reconcile_value(col, rowdata.get(col), text)
-            selected.append(rowdata)
-        return selected
-
-    @staticmethod
-    def _reconcile_value(col, original, text):
-        """Si el usuario no edito la celda (mismo texto que el original), se
-        conserva el valor original (con su tipo). Si la edito, se usa el texto;
-        para la fecha (col B) se intenta re-parsear."""
+        if self._loading or item.column() == 0:
+            return
+        row, col = item.row(), PREVIEW_COLUMNS[item.column() - 1]
+        if row >= len(self.preview_rows):
+            return
+        original = self.preview_rows[row].get(col)
+        text = item.text().strip()
         if _fmt_cell(original) == text:
-            return original
+            return
         if text == "":
-            return None
+            self.preview_rows[row][col] = None
+            return
         if col == "B":
-            dt = mapping.coerce_datetime(text)
-            if dt is not None:
-                return datetime.datetime(dt.year, dt.month, dt.day)
-        return text
+            parsed = mapping.coerce_datetime(text)
+            if parsed is not None:
+                self.preview_rows[row][col] = datetime.datetime(
+                    parsed.year, parsed.month, parsed.day)
+                return
+        self.preview_rows[row][col] = text
 
-    # ------------------------------------------------------------------
-    # Acciones
-    # ------------------------------------------------------------------
+    def _selected_rows(self) -> list:
+        return [row for row, keep in zip(self.preview_rows,
+                                         self.preview_checked) if keep]
+
+    def _selected_records(self) -> list:
+        """Filas marcadas como registros de la base local."""
+        out = []
+        for index, keep in enumerate(self.preview_checked):
+            if not keep:
+                continue
+            out.append(store.inspection_from_row(
+                self.preview_rows[index],
+                self.preview_codes[index] if index < len(self.preview_codes)
+                else "",
+                self.source_path))
+        return out
+
+    # ==================================================================
+    # Pestana 2: Full List almacenado
+    # ==================================================================
+    def _tab_full_list(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+
+        title = QLabel(i18n.t("full.title"))
+        title.setObjectName("sectionTitle")
+        lay.addWidget(title)
+        hint = QLabel(i18n.t("full.hint"))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel(i18n.t("full.filter_year")))
+        self.year_combo = QComboBox()
+        self.year_combo.currentIndexChanged.connect(self._refresh_full_list)
+        filters.addWidget(self.year_combo)
+
+        filters.addWidget(QLabel(i18n.t("full.filter_owner")))
+        self.owner_combo = QComboBox()
+        self.owner_combo.currentIndexChanged.connect(self._refresh_full_list)
+        filters.addWidget(self.owner_combo)
+
+        filters.addWidget(QLabel(i18n.t("full.filter_search")))
+        self.search_edit = QLineEdit()
+        self.search_edit.setMinimumWidth(180)
+        self.search_edit.textChanged.connect(self._refresh_full_list)
+        filters.addWidget(self.search_edit)
+        filters.addStretch(1)
+
+        btn_refresh = QPushButton(i18n.t("full.btn_refresh"))
+        btn_refresh.setObjectName("ghost")
+        btn_refresh.clicked.connect(self._on_refresh_store)
+        filters.addWidget(btn_refresh)
+        lay.addLayout(filters)
+
+        columns = [("col.date_target", "date"), ("col.vehicle", "vehicle_id"),
+                   ("col.fms", "fms_id"), ("col.fitted", "system_fitted"),
+                   ("col.hours", "equipment_hours"),
+                   ("col.fms_hours", "fms_hours"), ("col.status", "status"),
+                   ("col.inlets", "inlets"),
+                   ("col.addl_locked", "addl_inlets_locked"),
+                   ("col.drain_locked", "drain_valves_locked"),
+                   ("col.leaking", "fast_fill_leaking"),
+                   ("col.smu_tags", "smu_tags"),
+                   ("col.equipment", "equipment_type"),
+                   ("col.remarks", "remarks"),
+                   ("col.inspectors", "inspectors"), ("col.owner", "owner"),
+                   ("col.remedial", "remedial"), ("col.source", "source_file")]
+        self.full_columns = columns
+        self.full_table = QTableWidget(0, len(columns))
+        self.full_table.setHorizontalHeaderLabels(
+            [i18n.t(key) for key, _f in columns])
+        self.full_table.setAlternatingRowColors(True)
+        self.full_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.full_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.full_table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.full_table, 1)
+
+        bottom = QHBoxLayout()
+        self.lbl_full_rows = QLabel()
+        bottom.addWidget(self.lbl_full_rows)
+        self.lbl_full_limit = QLabel()
+        self.lbl_full_limit.setObjectName("hint")
+        bottom.addWidget(self.lbl_full_limit)
+        bottom.addStretch(1)
+        btn_delete = QPushButton(i18n.t("full.btn_delete"))
+        btn_delete.setObjectName("danger")
+        btn_delete.clicked.connect(self._on_delete_rows)
+        bottom.addWidget(btn_delete)
+        btn_export = QPushButton(i18n.t("full.btn_export"))
+        btn_export.setObjectName("accent")
+        btn_export.clicked.connect(self._on_export_report)
+        bottom.addWidget(btn_export)
+        lay.addLayout(bottom)
+        return page
+
+    def _populate_filters(self):
+        # Se bloquean las senales en vez de usar el candado global: llenar un
+        # combo emite currentIndexChanged por cada item, y cada uno redibujaria
+        # la tabla entera.
+        for combo in (self.year_combo, self.owner_combo):
+            combo.blockSignals(True)
+        try:
+            previous_year = self.year_combo.currentData()
+            previous_owner = self.owner_combo.currentData()
+            self.year_combo.clear()
+            self.year_combo.addItem(i18n.t("full.all"), None)
+            for year in sorted({r["date"][:4] for r in self.inspections
+                                if r.get("date")}, reverse=True):
+                self.year_combo.addItem(year, year)
+            self.owner_combo.clear()
+            self.owner_combo.addItem(i18n.t("full.all"), None)
+            for owner in sorted({r["owner"] for r in self.inspections
+                                 if r.get("owner")}):
+                self.owner_combo.addItem(owner, owner)
+            for combo, previous in ((self.year_combo, previous_year),
+                                    (self.owner_combo, previous_owner)):
+                index = combo.findData(previous)
+                combo.setCurrentIndex(max(index, 0))
+        finally:
+            for combo in (self.year_combo, self.owner_combo):
+                combo.blockSignals(False)
+
+    def _filtered_inspections(self) -> list:
+        year = self.year_combo.currentData()
+        owner = self.owner_combo.currentData()
+        text = (self.search_edit.text() or "").strip().upper()
+        rows = self.inspections
+        if year:
+            rows = [r for r in rows if (r.get("date") or "").startswith(year)]
+        if owner:
+            rows = [r for r in rows if r.get("owner") == owner]
+        if text:
+            fields = ("vehicle_id", "fms_id", "inspectors", "equipment_type",
+                      "remarks", "status")
+            rows = [r for r in rows
+                    if any(text in str(r.get(f) or "").upper()
+                           for f in fields)]
+        return rows
+
+    def _refresh_full_list(self, *_args):
+        if self._loading:
+            return
+        rows = self._filtered_inspections()
+        shown = rows[:_TABLE_LIMIT]
+        self.full_table.setRowCount(0)
+        self.full_table.setRowCount(len(shown))
+        for r, record in enumerate(shown):
+            for c, (_key, field) in enumerate(self.full_columns):
+                if field == "date":
+                    text = i18n.fmt_date(store.parse_date(record.get("date")))
+                elif field in ("system_fitted", "addl_inlets_locked",
+                               "drain_valves_locked", "fast_fill_leaking"):
+                    text = i18n.tr_value(record.get(field))
+                else:
+                    text = str(record.get(field) or "")
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, record.get("id"))
+                self.full_table.setItem(r, c, item)
+        self.full_table.resizeColumnsToContents()
+        self.lbl_full_rows.setText(i18n.t("full.rows", shown=len(rows),
+                                          total=len(self.inspections)))
+        self.lbl_full_limit.setText(
+            i18n.t("full.limit", shown=len(shown), total=len(rows))
+            if len(rows) > len(shown) else "")
+
+    # ==================================================================
+    # Pestana 3: tablero
+    # ==================================================================
+    def _tab_dashboard(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(8)
+        self.card_inspections = _card(cards, "0",
+                                      i18n.t("dash.card_inspections"),
+                                      i18n.t("dash.card_inspections_hint"))
+        self.card_fleet = _card(cards, "0", i18n.t("dash.card_fleet"),
+                                i18n.t("dash.card_fleet_hint"))
+        self.card_pct = _card(cards, "-", i18n.t("dash.card_pct"),
+                              i18n.t("dash.card_pct_hint"))
+        self.card_last = _card(cards, "0", i18n.t("dash.card_last"),
+                               i18n.t("dash.card_last_hint"))
+        lay.addLayout(cards)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel(i18n.t("dash.months")))
+        self.period_combo = QComboBox()
+        self.period_combo.currentIndexChanged.connect(self._refresh_dashboard)
+        controls.addWidget(self.period_combo)
+
+        controls.addSpacing(14)
+        controls.addWidget(QLabel(i18n.t("dash.chart")))
+        self.chart_combo = QComboBox()
+        for key, label in ((charts.CHART_BARS, "dash.chart_bars"),
+                           (charts.CHART_PIE, "dash.chart_pie"),
+                           (charts.CHART_EQUIPMENT, "dash.chart_equipment"),
+                           (charts.CHART_STATUS, "dash.chart_status")):
+            self.chart_combo.addItem(i18n.t(label), key)
+        self.chart_combo.currentIndexChanged.connect(self._render_chart)
+        controls.addWidget(self.chart_combo)
+        controls.addStretch(1)
+
+        btn_fleet = QPushButton(i18n.t("dash.btn_fleet_sizes"))
+        btn_fleet.setObjectName("ghost")
+        btn_fleet.clicked.connect(self._on_fleet_sizes)
+        controls.addWidget(btn_fleet)
+        lay.addLayout(controls)
+
+        splitter = QSplitter(Qt.Vertical)
+        chart_box = QWidget()
+        chart_layout = QVBoxLayout(chart_box)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas = charts.ChartCanvas()
+        chart_layout.addWidget(NavigationToolbar2QT(self.canvas, chart_box))
+        chart_layout.addWidget(self.canvas, 1)
+        splitter.addWidget(chart_box)
+
+        self.kpi_table = QTableWidget(0, 5)
+        self.kpi_table.setHorizontalHeaderLabels([
+            i18n.t("dash.table_month"), i18n.t("dash.table_reviewed"),
+            i18n.t("dash.table_rows"), i18n.t("dash.table_fleet"),
+            i18n.t("dash.table_pct")])
+        self.kpi_table.setAlternatingRowColors(True)
+        self.kpi_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.kpi_table.verticalHeader().setVisible(False)
+        self.kpi_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch)
+        splitter.addWidget(self.kpi_table)
+        splitter.setSizes([520, 260])
+        lay.addWidget(splitter, 1)
+        return page
+
+    def _populate_period_combo(self):
+        self.period_combo.blockSignals(True)
+        try:
+            current = self.period_combo.currentData()
+            self.period_combo.clear()
+            self.period_combo.addItem(i18n.t("dash.months_all"), None)
+            for count in (12, 24):
+                self.period_combo.addItem(
+                    i18n.t("dash.months_last", n=count), ("last", count))
+            years = sorted({r["date"][:4] for r in self.inspections
+                            if r.get("date")}, reverse=True)
+            for year in years:
+                self.period_combo.addItem(year, ("year", year))
+            index = self.period_combo.findData(current)
+            self.period_combo.setCurrentIndex(max(index, 0))
+        finally:
+            self.period_combo.blockSignals(False)
+
+    def _dashboard_window(self):
+        months = analytics.available_months(self.inspections)
+        choice = self.period_combo.currentData()
+        if not choice:
+            return months
+        kind, value = choice
+        if kind == "last":
+            return analytics.last_months(months, int(value))
+        return analytics.year_months(months, value)
+
+    def _export_window(self, rows: list) -> list:
+        """Meses del resumen dinamico que se exporta.
+
+        Se cruzan las dos cosas que el usuario eligio: el periodo del tablero y
+        el filtro de la pestana Full List. Si el resumen cubriera un periodo
+        mas ancho que las filas exportadas quedarian columnas de meses sin una
+        sola fila detras en el mismo archivo.
+        """
+        available = analytics.available_months(rows)
+        window = [m for m in self._dashboard_window() if m in set(available)]
+        return window or available
+
+    def _refresh_dashboard(self, *_args):
+        if self._loading:
+            return
+        window = self._dashboard_window()
+        self.pivot = analytics.build_pivot(self.inspections, window)
+        self.kpis = analytics.monthly_kpis(self.pivot, settings.fleet_sizes())
+        fleet_pct = analytics.fleet_maintenance_pct(self.pivot, self.kpis)
+        last = analytics.last_month_kpi(self.kpis)
+
+        self.card_inspections.value_label.setText(
+            i18n.fmt_number(self.pivot.total_inspections))
+        self.card_fleet.value_label.setText(
+            i18n.fmt_number(self.pivot.maintained_fleet))
+        self.card_pct.value_label.setText(
+            i18n.fmt_pct(fleet_pct, 1) if fleet_pct is not None else "-")
+        self.card_last.value_label.setText(
+            "%s  ·  %s" % (i18n.month_label(last.month),
+                           i18n.fmt_number(last.reviewed)) if last else "-")
+
+        self.kpi_table.setRowCount(len(self.kpis))
+        for row, kpi in enumerate(self.kpis):
+            values = [i18n.month_label(kpi.month),
+                      i18n.fmt_number(kpi.reviewed),
+                      i18n.fmt_number(kpi.inspections),
+                      i18n.fmt_number(kpi.fleet_size) if kpi.fleet_size else "",
+                      i18n.fmt_pct(kpi.pct, 1) if kpi.pct is not None else ""]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if col:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.kpi_table.setItem(row, col, item)
+        self._render_chart()
+
+    def _render_chart(self, *_args):
+        if self._loading:
+            return
+        rows = [r for r in self.inspections
+                if analytics.month_key(r.get("date")) in set(self.pivot.months)]
+        charts.render_maintenance(self.canvas, self.chart_combo.currentData(),
+                                  self.pivot, self.kpis, rows)
+
+    # ==================================================================
+    # Pestana 4: tags instalados por semana
+    # ==================================================================
+    def _tab_tags(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+
+        title = QLabel(i18n.t("tags.title"))
+        title.setObjectName("sectionTitle")
+        lay.addWidget(title)
+        hint = QLabel(i18n.t("tags.hint"))
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        btn_folder = QPushButton(i18n.t("tags.btn_folder"))
+        btn_folder.clicked.connect(self._on_load_tag_folder)
+        btn_files = QPushButton(i18n.t("tags.btn_files"))
+        btn_files.clicked.connect(self._on_load_tag_files)
+        buttons.addWidget(btn_folder)
+        buttons.addWidget(btn_files)
+        buttons.addStretch(1)
+        btn_clear = QPushButton(i18n.t("tags.btn_clear"))
+        btn_clear.setObjectName("danger")
+        btn_clear.clicked.connect(self._on_clear_tags)
+        buttons.addWidget(btn_clear)
+        btn_export = QPushButton(i18n.t("tags.btn_export"))
+        btn_export.setObjectName("accent")
+        btn_export.clicked.connect(self._on_export_tags)
+        buttons.addWidget(btn_export)
+        lay.addLayout(buttons)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(8)
+        self.card_tags_total = _card(cards, "0", i18n.t("tags.card_total"),
+                                     i18n.t("tags.card_total_hint"))
+        self.card_tags_installed = _card(
+            cards, "0", i18n.t("tags.card_installed"),
+            i18n.t("tags.card_installed_hint"))
+        self.card_tags_removed = _card(cards, "0", i18n.t("tags.card_removed"),
+                                       i18n.t("tags.card_removed_hint"))
+        self.card_tags_files = _card(cards, "0", i18n.t("tags.card_files"),
+                                     i18n.t("tags.card_files_hint"))
+        lay.addLayout(cards)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel(i18n.t("full.filter_year")))
+        self.tag_year_combo = QComboBox()
+        self.tag_year_combo.currentIndexChanged.connect(self._refresh_tag_view)
+        filters.addWidget(self.tag_year_combo)
+        filters.addWidget(QLabel(i18n.t("tags.filter_type")))
+        self.tag_type_combo = QComboBox()
+        self.tag_type_combo.currentIndexChanged.connect(self._refresh_tag_view)
+        filters.addWidget(self.tag_type_combo)
+        filters.addWidget(QLabel(i18n.t("tags.filter_device")))
+        self.tag_device_combo = QComboBox()
+        self.tag_device_combo.currentIndexChanged.connect(
+            self._refresh_tag_view)
+        filters.addWidget(self.tag_device_combo)
+        filters.addWidget(QLabel(i18n.t("tags.filter_dept")))
+        self.tag_dept_combo = QComboBox()
+        self.tag_dept_combo.currentIndexChanged.connect(self._refresh_tag_view)
+        filters.addWidget(self.tag_dept_combo)
+        filters.addSpacing(14)
+        filters.addWidget(QLabel(i18n.t("tags.chart")))
+        self.tag_chart_combo = QComboBox()
+        for key, label in ((charts.CHART_TAG_MONTH, "tags.chart_month"),
+                           (charts.CHART_TAG_TYPE, "tags.chart_type"),
+                           (charts.CHART_TAG_DEPT, "tags.chart_dept"),
+                           (charts.CHART_TAG_WEEK, "tags.chart_week")):
+            self.tag_chart_combo.addItem(i18n.t(label), key)
+        self.tag_chart_combo.currentIndexChanged.connect(self._render_tag_chart)
+        filters.addWidget(self.tag_chart_combo)
+        filters.addStretch(1)
+        self.lbl_tag_rows = QLabel()
+        filters.addWidget(self.lbl_tag_rows)
+        lay.addLayout(filters)
+
+        splitter = QSplitter(Qt.Vertical)
+        chart_box = QWidget()
+        chart_layout = QVBoxLayout(chart_box)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        self.tag_canvas = charts.ChartCanvas(height=3.8)
+        chart_layout.addWidget(NavigationToolbar2QT(self.tag_canvas, chart_box))
+        chart_layout.addWidget(self.tag_canvas, 1)
+        splitter.addWidget(chart_box)
+
+        self.tag_columns = [
+            ("col.move_type", "move_type"), ("col.date", "date"),
+            ("col.equipment_id", "equipment_id"), ("col.tag", "tag"),
+            ("col.device", "device_type"),
+            ("col.cost_center", "cost_center"),
+            ("col.department", "department"), ("col.product", "product"),
+            ("col.changed_by", "changed_by"), ("col.source", "source_file"),
+            ("col.inferred", "type_inferred"), ("col.note", "note")]
+        self.tag_table = QTableWidget(0, len(self.tag_columns))
+        self.tag_table.setHorizontalHeaderLabels(
+            [i18n.t(key) for key, _f in self.tag_columns])
+        self.tag_table.setAlternatingRowColors(True)
+        self.tag_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tag_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tag_table.horizontalHeader().setStretchLastSection(True)
+        splitter.addWidget(self.tag_table)
+        splitter.setSizes([420, 380])
+        lay.addWidget(splitter, 1)
+        return page
+
+    def _populate_tag_filters(self):
+        combos = (self.tag_year_combo, self.tag_type_combo,
+                  self.tag_device_combo, self.tag_dept_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+        try:
+            previous = [combo.currentData() for combo in combos]
+            self.tag_year_combo.clear()
+            self.tag_year_combo.addItem(i18n.t("full.all"), None)
+            for year in sorted({r["date"][:4] for r in self.movements
+                                if r.get("date")}, reverse=True):
+                self.tag_year_combo.addItem(year, year)
+            self.tag_type_combo.clear()
+            self.tag_type_combo.addItem(i18n.t("full.all"), None)
+            for move in tag_reader.MOVE_TYPES:
+                if any(r.get("move_type") == move for r in self.movements):
+                    self.tag_type_combo.addItem(i18n.tr_value(move), move)
+            self.tag_device_combo.clear()
+            self.tag_device_combo.addItem(i18n.t("full.all"), None)
+            for device in (tag_reader.DEVICE_SMU, tag_reader.DEVICE_TAG):
+                self.tag_device_combo.addItem(device, device)
+            self.tag_dept_combo.clear()
+            self.tag_dept_combo.addItem(i18n.t("full.all"), None)
+            for dept in sorted({r["department"] for r in self.movements
+                                if r.get("department")}):
+                self.tag_dept_combo.addItem(dept, dept)
+            for combo, value in zip(combos, previous):
+                index = combo.findData(value)
+                combo.setCurrentIndex(max(index, 0))
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
+
+    def _filtered_movements(self) -> list:
+        year = self.tag_year_combo.currentData()
+        move = self.tag_type_combo.currentData()
+        device = self.tag_device_combo.currentData()
+        dept = self.tag_dept_combo.currentData()
+        rows = self.movements
+        if year:
+            rows = [r for r in rows if (r.get("date") or "").startswith(year)]
+        if move:
+            rows = [r for r in rows if r.get("move_type") == move]
+        if device:
+            rows = [r for r in rows if r.get("device_type") == device]
+        if dept:
+            rows = [r for r in rows if r.get("department") == dept]
+        return rows
+
+    def _refresh_tag_view(self, *_args):
+        if self._loading:
+            return
+        rows = self._filtered_movements()
+        totals = analytics.tag_totals(rows)
+        self.card_tags_total.value_label.setText(
+            i18n.fmt_number(totals["total"]))
+        self.card_tags_installed.value_label.setText(
+            i18n.fmt_number(totals["installed"]))
+        self.card_tags_removed.value_label.setText(
+            i18n.fmt_number(totals["removed"]))
+        self.card_tags_files.value_label.setText(
+            i18n.fmt_number(totals["files"]))
+
+        shown = rows[:_TABLE_LIMIT]
+        self.tag_table.setRowCount(0)
+        self.tag_table.setRowCount(len(shown))
+        for r, record in enumerate(shown):
+            for c, (_key, field) in enumerate(self.tag_columns):
+                if field == "date":
+                    text = i18n.fmt_date(store.parse_date(record.get("date")))
+                elif field == "move_type":
+                    text = i18n.tr_value(record.get("move_type"))
+                elif field == "type_inferred":
+                    text = i18n.tr_value(
+                        "Y" if record.get("type_inferred") else "N")
+                elif field == "note":
+                    text = i18n.tr_note(record.get("note"))
+                else:
+                    text = str(record.get(field) or "")
+                self.tag_table.setItem(r, c, QTableWidgetItem(text))
+        self.tag_table.resizeColumnsToContents()
+        self.lbl_tag_rows.setText(i18n.t("tags.rows", shown=len(rows),
+                                         total=len(self.movements)))
+        self._render_tag_chart()
+
+    def _render_tag_chart(self, *_args):
+        if self._loading:
+            return
+        charts.render_tags(self.tag_canvas,
+                           self.tag_chart_combo.currentData(),
+                           self._filtered_movements())
+
+    # ==================================================================
+    # Recarga desde la base
+    # ==================================================================
+    def _refresh_views(self):
+        """Vuelve a llenar filtros, tablas, tarjetas y graficas desde la cache."""
+        self._populate_filters()
+        self._populate_period_combo()
+        self._populate_tag_filters()
+        self._refresh_full_list()
+        self._refresh_dashboard()
+        self._refresh_tag_view()
+        self._refresh_status()
+
+    def _reload_inspections(self):
+        self.inspections = store.inspections()
+        self._refresh_views()
+
+    def _reload_movements(self):
+        self.movements = store.movements()
+        self._refresh_views()
+
+    def _on_refresh_store(self, *_args):
+        self.inspections = store.inspections()
+        self.movements = store.movements()
+        self._refresh_views()
+
+    # ==================================================================
+    # Acciones: importar submissions
+    # ==================================================================
     def _on_load_source(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Cargar Excel de submissions del formulario", "",
-            "Excel (*.xlsx)")
+            self, i18n.t("dlg.open_source"),
+            os.path.dirname(self.source_path or ""),
+            i18n.t("dlg.excel_filter"))
         if not path:
             return
         try:
             subs = _run_with_progress(
-                self, "Cargando submissions",
-                "Leyendo %s ..." % os.path.basename(path),
+                self, i18n.t("prog.reading_title"),
+                i18n.t("prog.reading", file=os.path.basename(path)),
                 source_reader.read_submissions, path)
         except Exception as exc:
-            QMessageBox.critical(
-                self, "Error",
-                "No se pudo leer el Excel de submissions:\n%s" % exc)
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 i18n.t("msg.read_error", err=exc))
             return
         if not subs:
-            QMessageBox.warning(
-                self, "Sin datos",
-                "El archivo no contiene submissions reconocibles en la hoja "
-                "'Form Submissions'.")
+            QMessageBox.warning(self, i18n.t("dlg.warning"),
+                                i18n.t("msg.no_data"))
             return
+
         self.source_path = path
+        settings.set_("last_source_file", path)
         self.submissions = subs
-        self._populate_table()
+        self.preview_rows = mapping.submissions_to_rows(subs)
+        self.preview_codes = [s.get(mapping.H_CODE) or "" for s in subs]
+        self.preview_checked = [True] * len(self.preview_rows)
+        self._populate_preview()
         self._refresh_status()
         self.statusBar().showMessage(
-            "%d submissions cargadas desde %s" % (
-                len(subs), os.path.basename(path)))
+            i18n.t("msg.loaded", n=len(subs), file=os.path.basename(path)))
 
     def _on_pick_target(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar Excel destino "
-            "(Fleet Tag Inventory and Maintenance)", "", "Excel (*.xlsx)")
+            self, i18n.t("dlg.open_target"),
+            os.path.dirname(self.target_path or ""),
+            i18n.t("dlg.excel_filter"))
         if not path:
             return
         self.target_path = path
+        settings.set_("last_target_file", path)
         self._refresh_status()
         self.statusBar().showMessage(
-            "Destino: %s" % os.path.basename(path))
+            i18n.t("msg.target_set", file=os.path.basename(path)))
+
+    def _on_import_history(self):
+        if not self.target_path:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.pick_target_first"))
+            return
+        try:
+            rows = _run_with_progress(
+                self, i18n.t("prog.history_title"),
+                i18n.t("prog.history", sheet=source_reader.FULL_LIST_SHEET),
+                source_reader.read_full_list, self.target_path)
+        except Exception as exc:
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 i18n.t("msg.read_error", err=exc))
+            return
+
+        records = [store.inspection_from_row(row, "", self.target_path)
+                   for row in rows]
+        result = _run_with_progress(
+            self, i18n.t("prog.history_title"),
+            i18n.t("prog.history", sheet=source_reader.FULL_LIST_SHEET),
+            store.add_inspections, records)
+        self._reload_inspections()
+        QMessageBox.information(
+            self, i18n.t("dlg.info"),
+            i18n.t("msg.history_loaded", read=len(rows),
+                   sheet=source_reader.FULL_LIST_SHEET,
+                   added=result["added"], skipped=result["skipped"]))
+
+    def _on_store_only(self):
+        records = self._selected_records()
+        if not records:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.nothing_checked"))
+            return
+        result = store.add_inspections(records)
+        self._reload_inspections()
+        QMessageBox.information(
+            self, i18n.t("dlg.info"),
+            i18n.t("msg.stored", added=result["added"],
+                   skipped=result["skipped"]))
 
     def _on_append(self):
-        if not self.submissions or not self.target_path:
-            return
-        rows = self._collect_selected_rows()
-        if not rows:
-            QMessageBox.information(
-                self, "Nada que cargar",
-                "No hay filas marcadas para cargar.")
+        rows = self._selected_rows()
+        if not rows or not self.target_path:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.nothing_checked"))
             return
         confirm = QMessageBox.question(
-            self, "Confirmar carga",
-            "Se agregaran %d fila(s) a la hoja '%s' de:\n%s\n\n"
-            "Se hara un respaldo automatico del destino.\n\n¿Continuar?" % (
-                len(rows), excel_writer.SHEET_NAME,
-                os.path.basename(self.target_path)),
+            self, i18n.t("dlg.confirm"),
+            i18n.t("msg.confirm_append", n=len(rows),
+                   sheet=excel_writer.SHEET_NAME,
+                   file=os.path.basename(self.target_path)),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if confirm != QMessageBox.Yes:
             return
         try:
             result = _run_with_progress(
-                self, "Cargando al Excel destino",
-                "Escribiendo filas en '%s'..." % excel_writer.SHEET_NAME,
+                self, i18n.t("prog.writing_title"),
+                i18n.t("prog.writing", sheet=excel_writer.SHEET_NAME),
                 excel_writer.append_rows, self.target_path, rows,
                 self.chk_backup.isChecked())
         except PermissionError:
-            QMessageBox.critical(
-                self, "Archivo en uso",
-                "No se pudo escribir el Excel destino. Es probable que este "
-                "abierto en Excel. Cierrelo y vuelva a intentar.")
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 i18n.t("msg.file_in_use"))
             return
         except Exception as exc:
-            QMessageBox.critical(
-                self, "Error al cargar",
-                "%s\n\n%s" % (exc, traceback.format_exc()))
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 "%s\n\n%s" % (exc, traceback.format_exc()))
             return
 
-        msg = ("Se agregaron %d fila(s) a '%s'.\n"
-               "Filas %s a %s.\n\n" % (
-                   result["written"], result["sheet"],
-                   result["first_row"], result["last_row"]))
+        message = i18n.t("msg.append_done", n=result["written"],
+                         sheet=result["sheet"], first=result["first_row"],
+                         last=result["last_row"])
         if result["backup"]:
-            msg += "Respaldo creado:\n%s\n\n" % result["backup"]
-        msg += ("Abra el Excel y use 'Datos > Actualizar todo' para refrescar "
-                "los pivotes y las hojas de resumen.")
-        QMessageBox.information(self, "Carga completada", msg)
+            message += "\n\n" + i18n.t("msg.backup_made",
+                                       path=result["backup"])
+        if self.chk_store.isChecked():
+            stored = store.add_inspections(self._selected_records())
+            self._reload_inspections()
+            message += "\n\n" + i18n.t("msg.stored", added=stored["added"],
+                                       skipped=stored["skipped"])
+        message += "\n\n" + i18n.t("msg.refresh_hint")
+        QMessageBox.information(self, i18n.t("dlg.info"), message)
         self.statusBar().showMessage(
-            "Carga completada: %d fila(s) agregadas." % result["written"])
+            i18n.t("msg.append_done", n=result["written"],
+                   sheet=result["sheet"], first=result["first_row"],
+                   last=result["last_row"]).replace("\n", " "))
+
+    # ==================================================================
+    # Acciones: Full List almacenado
+    # ==================================================================
+    def _on_delete_rows(self):
+        ids = {self.full_table.item(index.row(), 0).data(Qt.UserRole)
+               for index in self.full_table.selectionModel().selectedRows()}
+        ids = {i for i in ids if i is not None}
+        if not ids:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.no_selection"))
+            return
+        confirm = QMessageBox.question(
+            self, i18n.t("dlg.confirm"),
+            i18n.t("msg.confirm_delete", n=len(ids)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        deleted = store.delete_inspections(list(ids))
+        self._reload_inspections()
+        QMessageBox.information(self, i18n.t("dlg.info"),
+                                i18n.t("msg.deleted", n=deleted))
+
+    def _on_export_report(self):
+        if not self.inspections:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.export_empty"))
+            return
+        path = self._ask_save_path(i18n.t("dlg.save_report"), "report")
+        if not path:
+            return
+        rows = self._filtered_inspections()
+        try:
+            _run_with_progress(
+                self, i18n.t("prog.export_title"), i18n.t("prog.export"),
+                report_export.export_maintenance, path, rows,
+                settings.fleet_sizes(), self._export_window(rows))
+        except PermissionError:
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 i18n.t("msg.file_in_use"))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 "%s\n\n%s" % (exc, traceback.format_exc()))
+            return
+        QMessageBox.information(self, i18n.t("dlg.info"),
+                                i18n.t("msg.export_done", path=path))
+
+    def _on_fleet_sizes(self):
+        months = analytics.available_months(self.inspections)
+        if not months:
+            months = sorted(settings.fleet_sizes())
+        dialog = FleetSizeDialog(self, months, settings.fleet_sizes())
+        if dialog.exec() == QDialog.Accepted:
+            # Los meses fuera de la ventana editada se conservan: el dialogo
+            # solo muestra los que tienen datos, y no puede borrar el resto.
+            sizes = dict(settings.fleet_sizes())
+            sizes.update(dialog.sizes())
+            for month in months:
+                if month not in dialog.sizes():
+                    sizes.pop(month, None)
+            settings.set_fleet_sizes(sizes)
+            self._refresh_dashboard()
+
+    # ==================================================================
+    # Acciones: tags
+    # ==================================================================
+    def _on_load_tag_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, i18n.t("dlg.open_tag_folder"),
+            settings.get("last_tag_folder") or "")
+        if not folder:
+            return
+        settings.set_("last_tag_folder", folder)
+        self._consolidate(tag_reader.find_files(folder))
+
+    def _on_load_tag_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, i18n.t("dlg.open_tag_files"),
+            settings.get("last_tag_folder") or "", i18n.t("dlg.excel_filter"))
+        if paths:
+            self._consolidate(paths)
+
+    def _consolidate(self, paths):
+        if not paths:
+            QMessageBox.warning(self, i18n.t("dlg.warning"),
+                                i18n.t("msg.tags_none"))
+            return
+        result = _run_with_progress(
+            self, i18n.t("prog.tags_title"), i18n.t("prog.tags"),
+            tag_reader.read_paths, paths)
+        if not result["records"]:
+            QMessageBox.warning(self, i18n.t("dlg.warning"),
+                                i18n.t("msg.tags_none"))
+            return
+        stored = store.add_movements(result["records"])
+        self._reload_movements()
+
+        message = i18n.t("msg.tags_stored", files=len(result["files"]),
+                         added=stored["added"], skipped=stored["skipped"])
+        if result["errors"]:
+            message += "\n\n" + "\n".join(
+                "%s: %s" % (name, err) for name, err in result["errors"][:8])
+        QMessageBox.information(self, i18n.t("dlg.info"), message)
+
+    def _on_clear_tags(self):
+        if not self.movements:
+            return
+        confirm = QMessageBox.question(
+            self, i18n.t("dlg.confirm"),
+            i18n.t("msg.confirm_clear_tags", n=len(self.movements)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        deleted = store.clear_movements()
+        self._reload_movements()
+        QMessageBox.information(self, i18n.t("dlg.info"),
+                                i18n.t("msg.deleted", n=deleted))
+
+    def _on_export_tags(self):
+        if not self.movements:
+            QMessageBox.information(self, i18n.t("dlg.info"),
+                                    i18n.t("msg.export_empty"))
+            return
+        path = self._ask_save_path(i18n.t("dlg.save_tags"), "tags")
+        if not path:
+            return
+        try:
+            _run_with_progress(
+                self, i18n.t("prog.export_title"), i18n.t("prog.export"),
+                report_export.export_tags, path, self._filtered_movements())
+        except PermissionError:
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 i18n.t("msg.file_in_use"))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, i18n.t("dlg.error"),
+                                 "%s\n\n%s" % (exc, traceback.format_exc()))
+            return
+        QMessageBox.information(self, i18n.t("dlg.info"),
+                                i18n.t("msg.export_done", path=path))
+
+    # ------------------------------------------------------------------
+    def _ask_save_path(self, title: str, kind: str) -> str:
+        suggested = report_export.default_path(
+            settings.get("last_export_dir") or "", kind)
+        path, _ = QFileDialog.getSaveFileName(self, title, suggested,
+                                              i18n.t("dlg.excel_filter"))
+        if path:
+            if not path.lower().endswith(".xlsx"):
+                path += ".xlsx"
+            settings.set_("last_export_dir", os.path.dirname(path))
+        return path
 
 
 def launch() -> int:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication.instance() or QApplication(sys.argv)
+    settings.load()
     window = MainWindow()
-    window.show()
+    geometry = settings.get("window") or {}
+    window.resize(int(geometry.get("w", 1420)), int(geometry.get("h", 900)))
+    if geometry.get("maximized"):
+        window.showMaximized()
+    else:
+        window.show()
     return app.exec()
 
 

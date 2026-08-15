@@ -65,6 +65,79 @@ def read_submissions(path: str, sheet_name: str = SHEET_NAME) -> list:
         wb.close()
 
 
+# ---------------------------------------------------------------------------
+# Lectura de la hoja 'Full List 2024-2025' del maestro
+# ---------------------------------------------------------------------------
+FULL_LIST_SHEET = "Full List 2024-2025"
+
+
+def _full_list_columns(header_row) -> dict:
+    """{letra_de_columna: indice} para las columnas de datos de la hoja.
+
+    Se buscan por encabezado y, si algun encabezado no coincide (el maestro
+    tiene erratas historicas como 'UPDPATES' que alguien puede corregir), se
+    cae a la posicion fija de la hoja. Las dos vias dan lo mismo mientras nadie
+    reordene columnas; la busqueda por nombre cubre el caso de que alguien lo
+    haga.
+    """
+    labels = {}
+    for idx, value in enumerate(header_row):
+        if isinstance(value, str) and value.strip():
+            labels[" ".join(value.split()).upper()] = idx
+
+    columns = {}
+    for letter in mapping.DATA_COLUMNS:
+        wanted = " ".join(mapping.TARGET_HEADERS[letter].split()).upper()
+        if wanted in labels:
+            columns[letter] = labels[wanted]
+        else:
+            columns[letter] = ord(letter) - ord("A")
+    return columns
+
+
+def read_full_list(path: str, sheet_name: str = FULL_LIST_SHEET,
+                   progress_cb=None) -> list:
+    """Lee el historico ya cargado en el maestro.
+
+    Devuelve filas {columna: valor} con la misma forma que produce `mapping`,
+    para que la base local pueda arrancar con los anos que ya estan en el Excel
+    y no solo con las submissions nuevas. Sin esto el tablero mostraria los
+    meses del ultimo export y los indicadores no coincidirian con los del
+    maestro.
+
+    Se saltan las filas sin fecha NI equipo: la tabla `Table3` termina con una
+    fila plantilla que solo trae las formulas de 'Date' y 'Verified'.
+    """
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(
+                "El Excel no tiene la hoja '%s'." % sheet_name)
+        ws = wb[sheet_name]
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header is None:
+            return []
+        columns = _full_list_columns(header)
+
+        total = max(ws.max_row - 1, 1)
+        out = []
+        for i, raw in enumerate(rows):
+            if raw is None or all(v in (None, "") for v in raw):
+                continue
+            record = {}
+            for letter, idx in columns.items():
+                record[letter] = raw[idx] if idx < len(raw) else None
+            if record.get("B") in (None, "") and record.get("C") in (None, ""):
+                continue
+            out.append(record)
+            if progress_cb and i % 250 == 0:
+                progress_cb(i + 1, total, "")
+        return out
+    finally:
+        wb.close()
+
+
 def submission_label(sub: dict) -> str:
     """Etiqueta corta para mostrar en logs/UI: 'MOFFM-12 (vehiculo 836)'."""
     code = sub.get(mapping.H_CODE) or sub.get(mapping.H_ID) or "?"

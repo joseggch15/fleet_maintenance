@@ -21,3 +21,7 @@ _tmp_*
 # Excel del cliente (no versionar datos reales)
 /data/
 *.local.xlsx
+
+# Base local y preferencias: son del equipo donde corre la herramienta
+fleet_data.sqlite3
+user_settings.json
